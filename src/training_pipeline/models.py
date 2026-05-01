@@ -1,0 +1,177 @@
+"""
+All 12 model definitions with their Optuna / RandomizedSearchCV search spaces.
+Models are organized as (name, estimator, search_space, tuner_type).
+"""
+import numpy as np
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.multioutput import MultiOutputRegressor
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
+import optuna
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# ─── Model Registry ───────────────────────────────────────────────────────────
+
+def _wrap_multi(estimator):
+    """Wrap single-output estimators for multi-output (3 targets)."""
+    return MultiOutputRegressor(estimator, n_jobs=-1)
+
+
+CLASSICAL_MODELS = [
+    {
+        "name": "Ridge",
+        "estimator": _wrap_multi(Ridge()),
+        "tuner": "random",
+        "param_dist": {"estimator__alpha": [0.001, 0.01, 0.1, 1, 10, 100]},
+    },
+    {
+        "name": "Lasso",
+        "estimator": _wrap_multi(Lasso(max_iter=5000)),
+        "tuner": "random",
+        "param_dist": {"estimator__alpha": [0.001, 0.01, 0.1, 1, 10, 100]},
+    },
+    {
+        "name": "ElasticNet",
+        "estimator": _wrap_multi(ElasticNet(max_iter=5000)),
+        "tuner": "random",
+        "param_dist": {
+            "estimator__alpha":    [0.001, 0.01, 0.1, 1, 10],
+            "estimator__l1_ratio": np.linspace(0.1, 0.9, 9).tolist(),
+        },
+    },
+    {
+        "name": "SVR",
+        "estimator": _wrap_multi(SVR()),
+        "tuner": "random",
+        "param_dist": {
+            "estimator__C":       [0.1, 1, 10, 100],
+            "estimator__epsilon": [0.01, 0.1, 0.5, 1.0],
+            "estimator__kernel":  ["rbf", "linear"],
+        },
+    },
+    {
+        "name": "RandomForest",
+        "estimator": RandomForestRegressor(random_state=42, n_jobs=-1),
+        "tuner": "random",
+        "param_dist": {
+            "n_estimators":     [100, 200, 300],
+            "max_depth":        [8, 12, 16, None],
+            "max_features":     ["sqrt", "log2"],
+            "min_samples_leaf": [3, 5, 10],
+            "min_samples_split":[5, 10, 20],
+        },
+    },
+    {
+        "name": "GradientBoosting",
+        "estimator": _wrap_multi(GradientBoostingRegressor(random_state=42)),
+        "tuner": "random",
+        "param_dist": {
+            "estimator__n_estimators": [100, 200, 300],
+            "estimator__max_depth":    [3, 5, 7],
+            "estimator__learning_rate":[0.01, 0.05, 0.1, 0.2],
+            "estimator__min_samples_leaf": [3, 5, 10],
+        },
+    },
+]
+
+
+def xgb_suggest(trial: optuna.Trial) -> dict:
+    return {
+        "n_estimators":     trial.suggest_int("n_estimators", 100, 600),
+        "max_depth":        trial.suggest_int("max_depth", 3, 9),
+        "learning_rate":    trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+        "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
+        "reg_alpha":        trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+        "reg_lambda":       trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+        "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+    }
+
+
+def lgb_suggest(trial: optuna.Trial) -> dict:
+    return {
+        "n_estimators":    trial.suggest_int("n_estimators", 100, 600),
+        "num_leaves":      trial.suggest_int("num_leaves", 20, 150),
+        "learning_rate":   trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+        "lambda_l1":       trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True),
+        "lambda_l2":       trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True),
+        "min_child_samples":trial.suggest_int("min_child_samples", 10, 50),
+        "colsample_bytree":trial.suggest_float("colsample_bytree", 0.4, 1.0),
+        "subsample":       trial.suggest_float("subsample", 0.5, 1.0),
+    }
+
+
+def cat_suggest(trial: optuna.Trial) -> dict:
+    return {
+        "iterations":     trial.suggest_int("iterations", 100, 600),
+        "depth":          trial.suggest_int("depth", 3, 9),
+        "learning_rate":  trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+        "l2_leaf_reg":    trial.suggest_float("l2_leaf_reg", 1e-8, 10.0, log=True),
+        "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 1.0),
+    }
+
+
+OPTUNA_MODELS = [
+    {
+        "name":    "XGBoost",
+        "factory": lambda params: _wrap_multi(XGBRegressor(
+            objective="reg:squarederror", random_state=42,
+            eval_metric="rmse", early_stopping_rounds=30,
+            verbosity=0, **params,
+        )),
+        "suggest": xgb_suggest,
+        "n_trials": 80,
+    },
+    {
+        "name":    "LightGBM",
+        "factory": lambda params: _wrap_multi(LGBMRegressor(
+            objective="regression_l2", random_state=42,
+            n_jobs=-1, verbose=-1, **params,
+        )),
+        "suggest": lgb_suggest,
+        "n_trials": 80,
+    },
+    {
+        "name":    "CatBoost",
+        "factory": lambda params: _wrap_multi(CatBoostRegressor(
+            loss_function="RMSE", random_seed=42,
+            verbose=0, **params,
+        )),
+        "suggest": cat_suggest,
+        "n_trials": 50,
+    },
+]
+
+
+def build_lstm(units=64, dropout=0.2, learning_rate=1e-3, sequence_length=24, n_features=1, n_outputs=3):
+    """Build a 2-layer LSTM model for multi-step AQI forecasting."""
+    import tensorflow as tf
+    from tensorflow.keras import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout
+    from tensorflow.keras.optimizers import Adam
+    from tensorflow.keras.regularizers import l2
+
+    model = Sequential([
+        LSTM(units, return_sequences=True, input_shape=(sequence_length, n_features),
+             recurrent_dropout=dropout, kernel_regularizer=l2(1e-4)),
+        Dropout(dropout),
+        LSTM(units // 2, kernel_regularizer=l2(1e-4)),
+        Dropout(dropout),
+        Dense(32, activation="relu"),
+        Dense(n_outputs),
+    ])
+    model.compile(optimizer=Adam(learning_rate=learning_rate), loss="mse")
+    return model
+
+
+def lstm_suggest(trial: optuna.Trial) -> dict:
+    return {
+        "units":           trial.suggest_categorical("units", [32, 64, 128]),
+        "dropout":         trial.suggest_float("dropout", 0.1, 0.5),
+        "learning_rate":   trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
+        "sequence_length": trial.suggest_categorical("sequence_length", [24, 48, 72]),
+    }

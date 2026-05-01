@@ -1,0 +1,49 @@
+name: Training Pipeline (daily)
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # daily at 2 AM UTC
+  workflow_dispatch:        # allow manual trigger from GitHub UI
+
+jobs:
+  training-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120    # training can take up to 2 hours
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run backfill ablation study
+        env:
+          AQICN_API_KEY:       ${{ secrets.AQICN_API_KEY }}
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+          HOPSWORKS_API_KEY:   ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT:   ${{ secrets.HOPSWORKS_PROJECT }}
+          MLFLOW_TRACKING_URI: "mlruns"
+        run: python src/backfill/ablation_backfill.py
+
+      - name: Run training pipeline (all 12 models + distillation + ablation + registration)
+        env:
+          AQICN_API_KEY:       ${{ secrets.AQICN_API_KEY }}
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+          HOPSWORKS_API_KEY:   ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT:   ${{ secrets.HOPSWORKS_PROJECT }}
+          MLFLOW_TRACKING_URI: "mlruns"
+        run: python src/training_pipeline/train_model.py
+
+      - name: Upload MLflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-runs-${{ github.run_number }}
+          path: mlruns/
+          retention-days: 30

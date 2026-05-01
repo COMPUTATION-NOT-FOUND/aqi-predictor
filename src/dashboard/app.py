@@ -1,0 +1,213 @@
+"""
+Pearls AQI Predictor — Plotly Dash Dashboard
+5 tabs: Live Forecast | Model Leaderboard | Ablation Study | SHAP | Data Drift
+
+Run locally:  python src/dashboard/app.py
+Deploy:       Render free tier (see README.md Step 9)
+"""
+import dash
+from dash import dcc, html, Input, Output, State
+import dash_bootstrap_components as dbc
+import plotly.graph_objects as go
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from src.config import DEFAULT_CITY, AQI_ZONES, aqi_color, aqi_label
+from src.dashboard.components.alerts import build_alert_banner, ALERT_CSS
+from src.dashboard.components.gauge import build_gauge
+from src.dashboard.components.forecast_chart import build_forecast_chart
+from src.dashboard.components.leaderboard import build_leaderboard
+from src.dashboard.components.shap_plot import build_shap_bar
+from src.dashboard.components.drift_tab import build_drift_heatmap
+from src.dashboard.components.ablation_tab import build_ablation_charts
+
+# ─── App Init ─────────────────────────────────────────────────────────────────
+app = dash.Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.CYBORG, dbc.icons.FONT_AWESOME],
+    title="Pearls AQI Predictor",
+    suppress_callback_exceptions=True,
+)
+server = app.server   # expose Flask server for Render/Gunicorn
+
+# ─── Layout ───────────────────────────────────────────────────────────────────
+app.layout = dbc.Container(
+    fluid=True,
+    style={"backgroundColor": "#1e1e2e", "minHeight": "100vh", "padding": "0"},
+    children=[
+        # Inline CSS for alert animation
+        html.Style(ALERT_CSS),
+
+        # Header
+        dbc.Row(dbc.Col(html.Div([
+            html.H2("🌫 Pearls AQI Predictor", className="mb-0",
+                    style={"color": "#cdd6f4", "fontWeight": "700"}),
+            html.Small(f"City: {DEFAULT_CITY.title()} • Updates every hour",
+                       style={"color": "#a6adc8"}),
+        ]), width=12), style={"backgroundColor": "#181825", "padding": "18px 28px", "marginBottom": "0"}),
+
+        # Refresh interval (every 5 min)
+        dcc.Interval(id="interval-refresh", interval=5 * 60 * 1000, n_intervals=0),
+
+        # Tabs
+        dbc.Tabs(
+            id="main-tabs",
+            active_tab="tab-forecast",
+            style={"backgroundColor": "#181825", "borderBottom": "1px solid #313244"},
+            children=[
+                dbc.Tab(label="📊 Live Forecast",    tab_id="tab-forecast"),
+                dbc.Tab(label="🏆 Leaderboard",      tab_id="tab-leaderboard"),
+                dbc.Tab(label="🔬 Ablation Study",   tab_id="tab-ablation"),
+                dbc.Tab(label="🧠 SHAP",             tab_id="tab-shap"),
+                dbc.Tab(label="📡 Data Drift",       tab_id="tab-drift"),
+            ],
+        ),
+
+        # Tab content
+        html.Div(id="tab-content", style={"padding": "24px 28px"}),
+    ],
+)
+
+# ─── Callbacks ────────────────────────────────────────────────────────────────
+
+@app.callback(
+    Output("tab-content", "children"),
+    Input("main-tabs", "active_tab"),
+    Input("interval-refresh", "n_intervals"),
+)
+def render_tab(active_tab, _):
+    if active_tab == "tab-forecast":
+        return _render_forecast()
+    elif active_tab == "tab-leaderboard":
+        return _render_leaderboard()
+    elif active_tab == "tab-ablation":
+        return _render_ablation()
+    elif active_tab == "tab-shap":
+        return _render_shap()
+    elif active_tab == "tab-drift":
+        return _render_drift()
+    return html.Div("Unknown tab")
+
+
+def _render_forecast():
+    from src.dashboard.inference import predict_3day, get_recent_features
+    result = predict_3day()
+
+    current = result.get("current_aqi", 0)
+    a24     = result.get("aqi_24h", current)
+    a48     = result.get("aqi_48h", current)
+    a72     = result.get("aqi_72h", current)
+    lo24    = result.get("lower_24h", a24 * 0.85)
+    hi24    = result.get("upper_24h", a24 * 1.15)
+    error   = result.get("error")
+
+    try:
+        history = get_recent_features()
+    except Exception:
+        history = None
+
+    return dbc.Container(fluid=True, children=[
+        # Alert banner (only if hazardous)
+        build_alert_banner(max(current, a24, a48, a72)),
+
+        dbc.Row([
+            # Gauge — current AQI
+            dbc.Col(dcc.Graph(figure=build_gauge(current, "Current AQI"), config={"displayModeBar": False}), md=3),
+            # Gauge — 24h forecast
+            dbc.Col(dcc.Graph(figure=build_gauge(a24, "24h Forecast"), config={"displayModeBar": False}), md=3),
+            # Gauge — 48h forecast
+            dbc.Col(dcc.Graph(figure=build_gauge(a48, "48h Forecast"), config={"displayModeBar": False}), md=3),
+            # Gauge — 72h forecast
+            dbc.Col(dcc.Graph(figure=build_gauge(a72, "72h Forecast"), config={"displayModeBar": False}), md=3),
+        ], className="mb-3"),
+
+        # Forecast chart
+        dbc.Row(dbc.Col(
+            dcc.Graph(
+                figure=build_forecast_chart(current, a24, a48, a72, lo24, hi24, history),
+                config={"displayModeBar": True},
+                style={"height": "380px"},
+            ),
+            width=12,
+        )),
+
+        # AQI scale legend
+        dbc.Row(dbc.Col(html.Div([
+            html.Span(f"  {label}: {lo}–{hi}  ",
+                      style={"backgroundColor": color, "color": "#000", "padding": "2px 8px",
+                             "borderRadius": "4px", "marginRight": "6px", "fontSize": "0.75rem",
+                             "fontWeight": "bold"})
+            for lo, hi, label, color in AQI_ZONES
+        ]), width=12), className="mt-2"),
+
+        # Error notice (if model not yet trained)
+        html.Div(f"⚠ {error}", style={"color": "#f38ba8", "marginTop": "12px", "fontSize": "0.85rem"})
+        if error else html.Div(),
+    ])
+
+
+def _render_leaderboard():
+    from src.dashboard.inference import load_all_models_metadata
+    metadata = load_all_models_metadata()
+    return dbc.Container(fluid=True, children=[build_leaderboard(metadata)])
+
+
+def _render_ablation():
+    return dbc.Container(fluid=True, children=[
+        html.H4("Ablation Study Results", style={"color": "#cdd6f4"}),
+        html.P("Results auto-update every night after the training pipeline runs.",
+               style={"color": "#a6adc8", "fontSize": "0.85rem", "marginBottom": "16px"}),
+        dcc.Graph(figure=build_ablation_charts(), style={"height": "450px"}),
+        dbc.Row([
+            dbc.Col(html.Div([
+                html.H6("Feature Ablation", style={"color": "#cdd6f4"}),
+                html.P("Each bar shows how much RMSE increases when that feature group is removed. "
+                       "Taller bar = feature group is more important.",
+                       style={"color": "#a6adc8", "fontSize": "0.82rem"}),
+            ]), md=6),
+            dbc.Col(html.Div([
+                html.H6("Backfill Strategy", style={"color": "#cdd6f4"}),
+                html.P("Compares 5 imputation methods for missing sensor data. "
+                       "Gold bar = best strategy (lowest RMSE).",
+                       style={"color": "#a6adc8", "fontSize": "0.82rem"}),
+            ]), md=6),
+        ]),
+    ])
+
+
+def _render_shap():
+    from src.dashboard.inference import load_shap_data
+    shap_data = load_shap_data()
+    return dbc.Container(fluid=True, children=[
+        html.H4("SHAP Feature Importance", style={"color": "#cdd6f4"}),
+        html.P("Why did the model predict what it predicted? SHAP shows the contribution of each feature.",
+               style={"color": "#a6adc8", "fontSize": "0.85rem", "marginBottom": "16px"}),
+        dbc.Row([
+            dbc.Col(dcc.Graph(figure=build_shap_bar(shap_data, top_n=15),
+                              style={"height": "450px"}), md=8),
+            dbc.Col(html.Div([
+                html.H6("How to read this", style={"color": "#cdd6f4"}),
+                html.Ul([
+                    html.Li("Longer bar = feature has more influence on predictions", style={"color": "#a6adc8", "fontSize": "0.82rem"}),
+                    html.Li("Red bars = top-importance features", style={"color": "#a6adc8", "fontSize": "0.82rem"}),
+                    html.Li("SHAP values are computed on the best non-LSTM model (tree explainer)", style={"color": "#a6adc8", "fontSize": "0.82rem"}),
+                ]),
+            ]), md=4),
+        ]),
+    ])
+
+
+def _render_drift():
+    return dbc.Container(fluid=True, children=[
+        html.H4("Data Drift Monitor", style={"color": "#cdd6f4"}),
+        html.P([
+            "PSI < 0.1: no drift  |  PSI 0.1–0.2: moderate (yellow)  |  PSI > 0.2: alert (red — email sent)"
+        ], style={"color": "#a6adc8", "fontSize": "0.85rem", "marginBottom": "16px"}),
+        dcc.Graph(figure=build_drift_heatmap(), style={"height": "500px"}),
+    ])
+
+
+# ─── Entry Point ──────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8050))
+    app.run(host="0.0.0.0", port=port, debug=False)

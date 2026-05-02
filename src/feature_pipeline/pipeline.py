@@ -42,6 +42,11 @@ def run_pipeline(city: str = DEFAULT_CITY, lat: float = DEFAULT_LAT, lon: float 
 
     df = pd.DataFrame([row])
 
+    # Target columns are unknown at inference time; insert nulls to match schema
+    for col in ("aqi_24h", "aqi_48h", "aqi_72h"):
+        if col not in df.columns:
+            df[col] = float("nan")
+
     # 4. Apply pre-fit scaler (if available)
     scaler = load_scaler()
     if scaler is not None:

@@ -35,6 +35,7 @@ def insert_features(df: pd.DataFrame):
     """Insert a DataFrame of feature rows into the Hopsworks Feature Group."""
     if df.empty:
         return
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     fs = get_feature_store()
     fg = get_or_create_feature_group(fs)
     fg.insert(df, write_options={"wait_for_job": False})

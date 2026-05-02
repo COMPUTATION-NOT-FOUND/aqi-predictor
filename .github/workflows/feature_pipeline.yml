@@ -34,12 +34,12 @@ jobs:
         run: python src/feature_pipeline/pipeline.py
 
       - name: Send drift alert email (if PSI > 0.2)
-        if: failure()
+        if: failure() && secrets.ALERT_EMAIL != ''
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
           server_port: 465
-          username: ${{ secrets.EMAIL_USERNAME }}   # FILL IN: optional — add email secrets if you want alerts
+          username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
           subject: "AQI Pipeline: Data Drift Alert"
           body: "PSI drift threshold exceeded in the AQI feature pipeline. Check the drift dashboard."

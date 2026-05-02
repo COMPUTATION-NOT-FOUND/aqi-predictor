@@ -5,7 +5,7 @@ pandas>=2.1.0
 numpy>=1.26.0
 
 # Feature store
-hopsworks>=3.7.0
+hopsworks==4.7.*
 
 # Experiment tracking
 mlflow>=2.11.0

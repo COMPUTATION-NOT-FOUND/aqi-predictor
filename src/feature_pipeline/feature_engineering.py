@@ -76,9 +76,9 @@ def compute_physics_features(raw: dict) -> dict:
     return {
         "wind_dir_sin":           np.sin(wind_rad),
         "wind_dir_cos":           np.cos(wind_rad),
-        "mixing_height_proxy":    raw["temperature"] / max(raw["pressure"], 1) * 1000,
-        "wind_transport_effect":  raw["wind_speed"] * raw.get("pm25", 0),
-        "temp_humidity_interaction": raw["temperature"] * raw["humidity"] / 100,
+        "mixing_height_proxy":    raw.get("temperature", 0) / max(raw.get("pressure", 1013), 1) * 1000,
+        "wind_transport_effect":  raw.get("wind_speed", 0) * raw.get("pm25", 0),
+        "temp_humidity_interaction": raw.get("temperature", 0) * raw.get("humidity", 0) / 100,
         "pm_ratio":               raw.get("pm10", 0) / max(raw.get("pm25", 0.01), 0.01),
         "pressure_anomaly":       0.0,  # filled in after rolling computation
         "aqi_change_rate":        0.0,  # filled in after lag computation

@@ -34,7 +34,9 @@ jobs:
         run: python src/feature_pipeline/pipeline.py
 
       - name: Send drift alert email (if PSI > 0.2)
-        if: failure() && secrets.ALERT_EMAIL != ''
+        if: failure() && env.ALERT_EMAIL != ''
+        env:
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com

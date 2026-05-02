@@ -106,13 +106,17 @@ try:
     print(f"{PASS} pm25_to_aqi(35.4) = {aqi_val}  (expected ~100)")
 
     # Minimal dummy row
+    import pandas as pd
+    from datetime import datetime
     dummy = {
         "pm25": 35.4, "pm10": 70.0, "o3": 40.0, "no2": 20.0, "so2": 5.0, "co": 0.5,
         "temperature": 30.0, "humidity": 60.0, "wind_speed": 3.0, "wind_deg": 180.0,
         "pressure": 1010.0, "visibility": 10000, "cloud_cover": 20, "precipitation_1h": 0.0,
         "timestamp": "2026-05-01T12:00:00",
     }
-    row = build_feature_row(dummy)
+    dummy_history = pd.DataFrame()
+    dummy_ts = datetime(2026, 5, 1, 12, 0, 0)
+    row = build_feature_row(dummy, dummy_history, dummy_ts)
     print(f"{PASS} build_feature_row returned {len(row)} features")
     results.append(("FeatureEng", True))
 except Exception as e:

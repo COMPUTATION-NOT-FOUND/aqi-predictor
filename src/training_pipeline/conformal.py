@@ -12,52 +12,53 @@ Why conformal prediction over simple error bars?
 import numpy as np
 import pickle
 from pathlib import Path
-from mapie.regression import MapieRegressor
-from mapie.metrics import regression_coverage_score
+from mapie.regression import SplitConformalRegressor
+from mapie.metrics.regression import regression_coverage_score
 
 CONFORMAL_PATH = Path(__file__).parent.parent.parent / "conformal_calibrator.pkl"
 COVERAGE_LEVEL = 0.90   # 90% coverage guarantee
 
 
-def calibrate(model, X_cal: np.ndarray, y_cal: np.ndarray) -> MapieRegressor:
+def calibrate(model, X_cal: np.ndarray, y_cal: np.ndarray) -> SplitConformalRegressor:
     """
     Fit a MAPIE conformal calibrator on a held-out calibration set.
-    Uses the JAB+ method (split conformal) — works with any pre-fitted model.
+    Works with any pre-fitted sklearn-compatible model.
 
     Args:
         model  : any fitted sklearn-compatible regressor
         X_cal  : calibration features (held-out — never seen during training)
         y_cal  : true 24h AQI values for calibration (use primary target only)
     """
-    # MAPIE wraps the already-fitted model (prefit=True)
-    mapie = MapieRegressor(estimator=model, method="plus", cv="prefit")
-    mapie.fit(X_cal, y_cal)
+    mapie = SplitConformalRegressor(estimator=model, confidence_level=COVERAGE_LEVEL, prefit=True)
+    mapie.conformalize(X_cal, y_cal)
 
     with open(CONFORMAL_PATH, "wb") as f:
         pickle.dump(mapie, f)
 
     # Verify empirical coverage
-    preds, intervals = mapie.predict(X_cal, alpha=1 - COVERAGE_LEVEL)
-    coverage = regression_coverage_score(y_cal, intervals[:, 0, 0], intervals[:, 1, 0])
+    _, intervals = mapie.predict_interval(X_cal)
+    lower = intervals[:, 0, 0]
+    upper = intervals[:, 1, 0]
+    coverage = regression_coverage_score(y_cal, intervals[:, :, 0])
     print(f"[conformal] Calibration coverage: {coverage:.3f} (target: {COVERAGE_LEVEL})")
     return mapie
 
 
-def load_calibrator() -> MapieRegressor:
+def load_calibrator() -> SplitConformalRegressor:
     if not CONFORMAL_PATH.exists():
         return None
     with open(CONFORMAL_PATH, "rb") as f:
         return pickle.load(f)
 
 
-def predict_with_intervals(mapie: MapieRegressor, X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def predict_with_intervals(mapie: SplitConformalRegressor, X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Returns:
         point_preds  : shape (n_samples,)
         lower_bounds : shape (n_samples,)
         upper_bounds : shape (n_samples,)
     """
-    preds, intervals = mapie.predict(X, alpha=1 - COVERAGE_LEVEL)
+    preds, intervals = mapie.predict_interval(X)
     lower = intervals[:, 0, 0]
     upper = intervals[:, 1, 0]
     return preds, lower, upper

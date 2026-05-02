@@ -51,6 +51,9 @@ def fetch_training_data(start_time: str = None, end_time: str = None) -> pd.Data
     try:
         fv = fs.get_feature_view(name=fv_name, version=FEATURE_VERSION)
     except Exception:
+        fv = None
+
+    if fv is None:
         fv = fs.create_feature_view(
             name=fv_name,
             version=FEATURE_VERSION,

@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from src.config import DEFAULT_CITY, AQI_ZONES, aqi_color, aqi_label
-from src.dashboard.components.alerts import build_alert_banner, ALERT_CSS
+from src.dashboard.components.alerts import build_alert_banner
 from src.dashboard.components.gauge import build_gauge
 from src.dashboard.components.forecast_chart import build_forecast_chart
 from src.dashboard.components.leaderboard import build_leaderboard
@@ -35,9 +35,6 @@ app.layout = dbc.Container(
     fluid=True,
     style={"backgroundColor": "#1e1e2e", "minHeight": "100vh", "padding": "0"},
     children=[
-        # Inline CSS for alert animation
-        html.Style(ALERT_CSS),
-
         # Header
         dbc.Row(dbc.Col(html.Div([
             html.H2("🌫 Pearls AQI Predictor", className="mb-0",

@@ -13,7 +13,7 @@ def build_alert_banner(aqi: float) -> html.Div:
 
     return html.Div(
         children=[
-            html.Span("⚠️ ", style={"fontSize": "1.4rem"}),
+            html.I(className="fas fa-exclamation-triangle me-2"),
             html.Strong(f"HAZARDOUS AIR QUALITY ALERT — {label} (AQI {aqi:.0f})"),
             html.Br(),
             html.Span("Avoid outdoor activities. Sensitive groups should remain indoors.",

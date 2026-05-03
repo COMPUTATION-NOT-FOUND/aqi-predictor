@@ -425,6 +425,7 @@ def main():
 
     class _FirstOutputWrapper:
         def __init__(self, model): self.model = model
+        def fit(self, X, y): return self
         def predict(self, X): return self.model.predict(X)[:, 0]
 
     try:

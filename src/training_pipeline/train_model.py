@@ -61,7 +61,7 @@ for _logger in ["mlflow", "mlflow.models.model", "mlflow.sklearn", "mlflow.utils
     logging.getLogger(_logger).setLevel(logging.ERROR)
 
 TARGET_COLS  = [f"aqi_{h}h" for h in FORECAST_HOURS]
-N_SPLITS_OOF = 5
+N_SPLITS_OOF = 3
 SHAP_PATH    = Path(__file__).parent.parent.parent / "shap_values.pkl"
 
 
@@ -76,6 +76,17 @@ class WeightedVoter:
     def predict(self, X):
         preds = np.stack([m.predict(X) for m in self.models], axis=0)
         return np.einsum("i,ijk->jk", self.weights, preds)
+
+
+class KerasWrapper:
+    def __init__(self, model): self.model = model
+    def predict(self, X): return self.model.predict(X, verbose=0)
+
+
+class _FirstOutputWrapper:
+    def __init__(self, model): self.model = model
+    def fit(self, X, y): return self
+    def predict(self, X): return self.model.predict(X)[:, 0]
 
 
 # ─── Data Preparation ─────────────────────────────────────────────────────────
@@ -138,7 +149,7 @@ def train_classical(X_train, Y_train, X_test, Y_test, y_persistence, scaler) -> 
             # Tune hyperparams
             search = RandomizedSearchCV(
                 est, spec["param_dist"],
-                n_iter=30, cv=TimeSeriesSplit(n_splits=3),
+                n_iter=15, cv=TimeSeriesSplit(n_splits=3),
                 scoring="neg_root_mean_squared_error",
                 n_jobs=-1, random_state=42, verbose=0,
             )
@@ -406,10 +417,6 @@ def main():
             X_val=X_val, y_val=Y_val,
         )
 
-        class KerasWrapper:
-            def __init__(self, model): self.model = model
-            def predict(self, X): return self.model.predict(X, verbose=0)
-
         wrapped_student = KerasWrapper(student)
         test_preds_s    = wrapped_student.predict(X_test).ravel()
         s_metrics       = evaluate_all(Y_test.ravel(), test_preds_s, y_pers)
@@ -422,11 +429,6 @@ def main():
         [r for r in all_results if r["name"] not in ("LSTM", "DistilledMLP")],
         key=lambda r: r["metrics"]["rmse"],
     )[0]
-
-    class _FirstOutputWrapper:
-        def __init__(self, model): self.model = model
-        def fit(self, X, y): return self
-        def predict(self, X): return self.model.predict(X)[:, 0]
 
     try:
         calibrate(_FirstOutputWrapper(best_non_lstm["model"]), X_val, Y_val[:, 0])

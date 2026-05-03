@@ -14,27 +14,27 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # ─── Model Registry ───────────────────────────────────────────────────────────
 
-def _wrap_multi(estimator):
+def _wrap_multi(estimator, n_jobs=-1):
     """Wrap single-output estimators for multi-output (3 targets)."""
-    return MultiOutputRegressor(estimator, n_jobs=-1)
+    return MultiOutputRegressor(estimator, n_jobs=n_jobs)
 
 
 CLASSICAL_MODELS = [
     {
         "name": "Ridge",
-        "estimator": _wrap_multi(Ridge()),
+        "estimator": _wrap_multi(Ridge(), n_jobs=1),
         "tuner": "random",
         "param_dist": {"estimator__alpha": [0.001, 0.01, 0.1, 1, 10, 100]},
     },
     {
         "name": "Lasso",
-        "estimator": _wrap_multi(Lasso(max_iter=5000)),
+        "estimator": _wrap_multi(Lasso(max_iter=5000), n_jobs=1),
         "tuner": "random",
         "param_dist": {"estimator__alpha": [0.001, 0.01, 0.1, 1, 10, 100]},
     },
     {
         "name": "ElasticNet",
-        "estimator": _wrap_multi(ElasticNet(max_iter=5000)),
+        "estimator": _wrap_multi(ElasticNet(max_iter=5000), n_jobs=1),
         "tuner": "random",
         "param_dist": {
             "estimator__alpha":    [0.001, 0.01, 0.1, 1, 10],
@@ -43,25 +43,25 @@ CLASSICAL_MODELS = [
     },
     {
         "name": "RandomForest",
-        "estimator": RandomForestRegressor(random_state=42, n_jobs=1),
+        "estimator": RandomForestRegressor(random_state=42, n_jobs=-1),
         "tuner": "random",
         "param_dist": {
-            "n_estimators":     [100, 200, 300],
-            "max_depth":        [8, 12, 16, None],
-            "max_features":     ["sqrt", "log2"],
-            "min_samples_leaf": [3, 5, 10],
-            "min_samples_split":[5, 10, 20],
+            "n_estimators":      [50, 100, 200],
+            "max_depth":         [8, 12, 16, None],
+            "max_features":      ["sqrt", "log2"],
+            "min_samples_leaf":  [3, 5, 10],
+            "min_samples_split": [5, 10, 20],
         },
     },
     {
         "name": "GradientBoosting",
-        "estimator": _wrap_multi(GradientBoostingRegressor(random_state=42)),
+        "estimator": _wrap_multi(GradientBoostingRegressor(random_state=42), n_jobs=1),
         "tuner": "random",
         "param_dist": {
-            "estimator__n_estimators": [50, 100, 150],
-            "estimator__max_depth":    [3, 5, 7],
-            "estimator__learning_rate":[0.05, 0.1, 0.2],
-            "estimator__min_samples_leaf": [3, 5, 10],
+            "estimator__n_estimators":    [50, 100, 150],
+            "estimator__max_depth":       [3, 5, 7],
+            "estimator__learning_rate":   [0.05, 0.1, 0.2],
+            "estimator__min_samples_leaf":[3, 5, 10],
         },
     },
 ]
@@ -69,7 +69,7 @@ CLASSICAL_MODELS = [
 
 def xgb_suggest(trial: optuna.Trial) -> dict:
     return {
-        "n_estimators":     trial.suggest_int("n_estimators", 100, 600),
+        "n_estimators":     trial.suggest_int("n_estimators", 100, 300),
         "max_depth":        trial.suggest_int("max_depth", 3, 9),
         "learning_rate":    trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
         "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
@@ -83,7 +83,7 @@ def xgb_suggest(trial: optuna.Trial) -> dict:
 
 def cat_suggest(trial: optuna.Trial) -> dict:
     return {
-        "iterations":     trial.suggest_int("iterations", 100, 600),
+        "iterations":     trial.suggest_int("iterations", 100, 300),
         "depth":          trial.suggest_int("depth", 3, 9),
         "learning_rate":  trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
         "l2_leaf_reg":    trial.suggest_float("l2_leaf_reg", 1e-8, 10.0, log=True),
@@ -99,7 +99,7 @@ OPTUNA_MODELS = [
             verbosity=0, **params,
         ), n_jobs=1),
         "suggest": xgb_suggest,
-        "n_trials": 30,
+        "n_trials": 20,
     },
     {
         "name":    "CatBoost",
@@ -108,7 +108,7 @@ OPTUNA_MODELS = [
             verbose=0, **params,
         ), n_jobs=1),
         "suggest": cat_suggest,
-        "n_trials": 10,
+        "n_trials": 5,
     },
 ]
 

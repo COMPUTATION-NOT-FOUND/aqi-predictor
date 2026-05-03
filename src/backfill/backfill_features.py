@@ -19,6 +19,13 @@ from statsmodels.tsa.seasonal import STL
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+
+# Force all feature groups on for backfill — Hopsworks schema must stay complete.
+# Ablation overrides apply to training only, not to what gets stored.
+import src.config as _cfg
+for _k in _cfg.FEATURE_GROUPS:
+    _cfg.FEATURE_GROUPS[_k] = True
+
 from src.config import (
     DEFAULT_CITY, DEFAULT_LAT, DEFAULT_LON, BACKFILL_DAYS, FORECAST_HOURS,
 )

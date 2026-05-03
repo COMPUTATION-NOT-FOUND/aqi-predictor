@@ -4,6 +4,7 @@ Both APIs return µg/m³ concentrations — no unit conversion needed.
 """
 import requests
 import time
+import pandas as pd
 from datetime import datetime, timezone
 from typing import Optional
 import sys
@@ -65,6 +66,69 @@ def fetch_openweather(lat: float = DEFAULT_LAT, lon: float = DEFAULT_LON) -> Opt
         "cloud_cover":    float(wd["clouds"]["all"]),
         "precipitation_1h": float(wd.get("rain", {}).get("1h", 0.0)),
     }
+
+
+def fetch_historical_weather_openmeteo(
+    lat: float,
+    lon: float,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """
+    Fetch hourly historical weather from Open-Meteo (free, no API key needed).
+    Returns a DataFrame indexed by UTC timestamp with columns matching
+    the fields expected by build_feature_row().
+    """
+    import pandas as pd
+    import openmeteo_requests
+    import requests_cache
+    from retry_requests import retry
+
+    cache_session = requests_cache.CachedSession(".openmeteo_cache", expire_after=-1)
+    retry_session = retry(cache_session, retries=3, backoff_factor=0.5)
+    client = openmeteo_requests.Client(session=retry_session)
+
+    params = {
+        "latitude":        lat,
+        "longitude":       lon,
+        "start_date":      start_date,
+        "end_date":        end_date,
+        "hourly": [
+            "temperature_2m",
+            "relative_humidity_2m",
+            "surface_pressure",
+            "wind_speed_10m",
+            "wind_direction_10m",
+            "cloud_cover",
+            "precipitation",
+        ],
+        "timezone": "UTC",
+    }
+
+    responses = client.weather_api("https://archive-api.open-meteo.com/v1/archive", params=params)
+    resp = responses[0]
+    hourly = resp.Hourly()
+
+    times = pd.date_range(
+        start=pd.Timestamp(hourly.Time(), unit="s", tz="UTC"),
+        end=pd.Timestamp(hourly.TimeEnd(), unit="s", tz="UTC"),
+        freq=pd.Timedelta(seconds=hourly.Interval()),
+        inclusive="left",
+    )
+
+    df = pd.DataFrame({
+        "timestamp":        times,
+        "temperature":      hourly.Variables(0).ValuesAsNumpy(),
+        "humidity":         hourly.Variables(1).ValuesAsNumpy(),
+        "pressure":         hourly.Variables(2).ValuesAsNumpy(),
+        "wind_speed":       hourly.Variables(3).ValuesAsNumpy(),
+        "wind_deg":         hourly.Variables(4).ValuesAsNumpy(),
+        "cloud_cover":      hourly.Variables(5).ValuesAsNumpy(),
+        "precipitation_1h": hourly.Variables(6).ValuesAsNumpy(),
+        "visibility":       10.0,  # not available in archive API — use clear-sky default
+    })
+    df = df.set_index("timestamp")
+    return df
 
 
 def fetch_historical_aqicn(city: str, date_str: str) -> Optional[dict]:

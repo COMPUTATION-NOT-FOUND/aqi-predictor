@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from src.config import (
     DEFAULT_CITY, DEFAULT_LAT, DEFAULT_LON, BACKFILL_DAYS, FORECAST_HOURS,
 )
-from src.feature_pipeline.fetch_data import fetch_historical_openweather
+from src.feature_pipeline.fetch_data import fetch_historical_openweather, fetch_historical_weather_openmeteo
 from src.feature_pipeline.feature_engineering import build_feature_row, pm25_to_aqi
 from src.feature_pipeline.store_features import insert_features
 
@@ -130,7 +130,7 @@ def backfill(
     start_dt = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
     end_dt   = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
 
-    # Fetch raw hourly history from OpenWeather Air Pollution History API
+    # Fetch pollutant history from OpenWeather Air Pollution History API
     raw_rows = fetch_historical_openweather(lat, lon, int(start_dt.timestamp()), int(end_dt.timestamp()))
     if not raw_rows:
         print("[backfill] No data returned from OpenWeather history API")
@@ -139,6 +139,15 @@ def backfill(
     df_raw = pd.DataFrame(raw_rows)
     df_raw["timestamp"] = pd.to_datetime(df_raw["timestamp"])
     df_raw = df_raw.set_index("timestamp").sort_index()
+
+    # Fetch historical weather from Open-Meteo (free, no API key needed)
+    print("[backfill] Fetching historical weather from Open-Meteo...")
+    try:
+        df_weather = fetch_historical_weather_openmeteo(lat, lon, start_date, end_date)
+        df_raw = df_raw.join(df_weather, how="left")
+        print(f"[backfill] Weather joined — {df_weather.columns.tolist()}")
+    except Exception as e:
+        print(f"[backfill] Open-Meteo fetch failed ({e}) — weather fields will be zero")
 
     # Apply chosen imputation strategy
     impute_fn = STRATEGIES.get(strategy, impute_hybrid)

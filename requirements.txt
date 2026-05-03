@@ -2,6 +2,9 @@
 gunicorn>=21.2.0
 
 # Data fetching & utilities
+openmeteo-requests>=0.3.0
+requests-cache>=1.2.0
+retry-requests>=2.0.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 pandas>=2.1.0

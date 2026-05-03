@@ -37,10 +37,8 @@ app.layout = dbc.Container(
     children=[
         # Header
         dbc.Row(dbc.Col(html.Div([
-            html.H2([
-                html.I(className="fas fa-wind me-2"),
-                "Pearls AQI Predictor",
-            ], className="mb-0", style={"color": "#cdd6f4", "fontWeight": "700"}),
+            html.H2("Pearls AQI Predictor", className="mb-0",
+                    style={"color": "#cdd6f4", "fontWeight": "700"}),
             html.Small(f"City: {DEFAULT_CITY.title()} • Updates every hour",
                        style={"color": "#a6adc8"}),
         ]), width=12), style={"backgroundColor": "#181825", "padding": "18px 28px", "marginBottom": "0"}),
@@ -54,11 +52,11 @@ app.layout = dbc.Container(
             active_tab="tab-forecast",
             style={"backgroundColor": "#181825", "borderBottom": "1px solid #313244"},
             children=[
-                dbc.Tab(label=html.Span([html.I(className="fas fa-chart-bar me-2"), "Live Forecast"]),    tab_id="tab-forecast"),
-                dbc.Tab(label=html.Span([html.I(className="fas fa-trophy me-2"),   "Leaderboard"]),      tab_id="tab-leaderboard"),
-                dbc.Tab(label=html.Span([html.I(className="fas fa-vial me-2"),     "Ablation Study"]),   tab_id="tab-ablation"),
-                dbc.Tab(label=html.Span([html.I(className="fas fa-brain me-2"),    "Feature Importance"]),tab_id="tab-shap"),
-                dbc.Tab(label=html.Span([html.I(className="fas fa-signal me-2"),   "Data Drift"]),       tab_id="tab-drift"),
+                dbc.Tab(label="Live Forecast",     tab_id="tab-forecast"),
+                dbc.Tab(label="Leaderboard",       tab_id="tab-leaderboard"),
+                dbc.Tab(label="Ablation Study",    tab_id="tab-ablation"),
+                dbc.Tab(label="Feature Importance",tab_id="tab-shap"),
+                dbc.Tab(label="Data Drift",        tab_id="tab-drift"),
             ],
         ),
 

@@ -1,3 +1,6 @@
+# Server
+gunicorn>=21.2.0
+
 # Data fetching & utilities
 requests>=2.31.0
 python-dotenv>=1.0.0

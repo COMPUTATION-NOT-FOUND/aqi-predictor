@@ -14,7 +14,7 @@ pandas>=2.1.0
 numpy>=1.26.0
 
 # Feature store
-hopsworks[python]==4.7.*
+hopsworks[python]==3.7.0
 
 # Experiment tracking (reads mlruns/ for ablation tab)
 mlflow>=2.11.0

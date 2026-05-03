@@ -102,7 +102,7 @@ def run_ablation(df: pd.DataFrame):
             mlflow.log_metric("rmse", group_rmse)
             mlflow.log_metric("rmse_delta", delta)
 
-        results[group] = group_rmse
+        results[group] = delta
         print(f"[ablation_features] drop '{group}': RMSE={group_rmse:.2f} (Δ={delta:+.2f})")
 
-    return results
+    return results  # {group: delta} — negative delta means group is hurting performance

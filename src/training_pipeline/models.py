@@ -4,11 +4,9 @@ Models are organized as (name, estimator, search_space, tuner_type).
 """
 import numpy as np
 from sklearn.linear_model import Ridge, Lasso, ElasticNet
-from sklearn.svm import SVR
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.multioutput import MultiOutputRegressor
 from xgboost import XGBRegressor
-from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
 import optuna
 
@@ -44,18 +42,8 @@ CLASSICAL_MODELS = [
         },
     },
     {
-        "name": "SVR",
-        "estimator": _wrap_multi(SVR()),
-        "tuner": "random",
-        "param_dist": {
-            "estimator__C":       [0.1, 1, 10, 100],
-            "estimator__epsilon": [0.01, 0.1, 0.5, 1.0],
-            "estimator__kernel":  ["rbf", "linear"],
-        },
-    },
-    {
         "name": "RandomForest",
-        "estimator": RandomForestRegressor(random_state=42, n_jobs=-1),
+        "estimator": RandomForestRegressor(random_state=42, n_jobs=1),
         "tuner": "random",
         "param_dist": {
             "n_estimators":     [100, 200, 300],
@@ -70,9 +58,9 @@ CLASSICAL_MODELS = [
         "estimator": _wrap_multi(GradientBoostingRegressor(random_state=42)),
         "tuner": "random",
         "param_dist": {
-            "estimator__n_estimators": [100, 200, 300],
+            "estimator__n_estimators": [50, 100, 150],
             "estimator__max_depth":    [3, 5, 7],
-            "estimator__learning_rate":[0.01, 0.05, 0.1, 0.2],
+            "estimator__learning_rate":[0.05, 0.1, 0.2],
             "estimator__min_samples_leaf": [3, 5, 10],
         },
     },
@@ -92,18 +80,6 @@ def xgb_suggest(trial: optuna.Trial) -> dict:
     }
 
 
-def lgb_suggest(trial: optuna.Trial) -> dict:
-    return {
-        "n_estimators":    trial.suggest_int("n_estimators", 100, 600),
-        "num_leaves":      trial.suggest_int("num_leaves", 20, 150),
-        "learning_rate":   trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
-        "lambda_l1":       trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True),
-        "lambda_l2":       trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True),
-        "min_child_samples":trial.suggest_int("min_child_samples", 10, 50),
-        "colsample_bytree":trial.suggest_float("colsample_bytree", 0.4, 1.0),
-        "subsample":       trial.suggest_float("subsample", 0.5, 1.0),
-    }
-
 
 def cat_suggest(trial: optuna.Trial) -> dict:
     return {
@@ -118,31 +94,21 @@ def cat_suggest(trial: optuna.Trial) -> dict:
 OPTUNA_MODELS = [
     {
         "name":    "XGBoost",
-        "factory": lambda params: _wrap_multi(XGBRegressor(
+        "factory": lambda params: MultiOutputRegressor(XGBRegressor(
             objective="reg:squarederror", random_state=42,
-            eval_metric="rmse", early_stopping_rounds=30,
             verbosity=0, **params,
-        )),
+        ), n_jobs=1),
         "suggest": xgb_suggest,
-        "n_trials": 80,
-    },
-    {
-        "name":    "LightGBM",
-        "factory": lambda params: _wrap_multi(LGBMRegressor(
-            objective="regression_l2", random_state=42,
-            n_jobs=-1, verbose=-1, **params,
-        )),
-        "suggest": lgb_suggest,
-        "n_trials": 80,
+        "n_trials": 30,
     },
     {
         "name":    "CatBoost",
-        "factory": lambda params: _wrap_multi(CatBoostRegressor(
+        "factory": lambda params: MultiOutputRegressor(CatBoostRegressor(
             loss_function="RMSE", random_seed=42,
             verbose=0, **params,
-        )),
+        ), n_jobs=1),
         "suggest": cat_suggest,
-        "n_trials": 50,
+        "n_trials": 10,
     },
 ]
 

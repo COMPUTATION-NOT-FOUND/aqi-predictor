@@ -12,6 +12,18 @@ Steps:
 8. Run feature ablation study
 9. Register all models with Champion-Challenger gate
 """
+import os, warnings
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "false"
+warnings.filterwarnings("ignore")
+
+import logging
+for _logger in ["mlflow", "mlflow.models.model", "mlflow.sklearn", "mlflow.utils",
+                "tensorflow", "absl", "hopsworks"]:
+    logging.getLogger(_logger).setLevel(logging.ERROR)
+
 import numpy as np
 import pandas as pd
 import mlflow
@@ -43,9 +55,27 @@ from src.training_pipeline.register_model import register_all
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+# Re-apply after imports since mlflow resets its loggers on import
+for _logger in ["mlflow", "mlflow.models.model", "mlflow.sklearn", "mlflow.utils",
+                "mlflow.tensorflow", "tensorflow", "absl", "hopsworks"]:
+    logging.getLogger(_logger).setLevel(logging.ERROR)
+
 TARGET_COLS  = [f"aqi_{h}h" for h in FORECAST_HOURS]
 N_SPLITS_OOF = 5
 SHAP_PATH    = Path(__file__).parent.parent.parent / "shap_values.pkl"
+
+
+class WeightedVoter:
+    def __init__(self, models, weights):
+        self.models  = models
+        self.weights = weights
+    def fit(self, X, Y):
+        for m in self.models:
+            m.fit(X, Y)
+        return self
+    def predict(self, X):
+        preds = np.stack([m.predict(X) for m in self.models], axis=0)
+        return np.einsum("i,ijk->jk", self.weights, preds)
 
 
 # ─── Data Preparation ─────────────────────────────────────────────────────────
@@ -76,7 +106,7 @@ def load_and_split():
 def persistence_baseline(Y_train, Y_test, n_ahead: int = 0) -> np.ndarray:
     """Persistence: predict today's AQI for all horizons."""
     last_train_aqi = Y_train[-1, 0]
-    return np.full(len(Y_test), last_train_aqi)
+    return np.full(Y_test.size, last_train_aqi)
 
 
 # ─── Training Helpers ─────────────────────────────────────────────────────────
@@ -131,7 +161,7 @@ def train_classical(X_train, Y_train, X_test, Y_test, y_persistence, scaler) -> 
 
             mlflow.log_params(best_params)
             mlflow.log_metrics(metrics)
-            mlflow.sklearn.log_model(best_est, artifact_path="model")
+            mlflow.sklearn.log_model(best_est, name="model")
 
             print(f"[train] {name}: RMSE={metrics['rmse']:.2f} | IoA={metrics['ioa']:.3f} | "
                   f"Skill={metrics.get('skill_score', 0):.3f} | OOF={oof:.2f}")
@@ -179,7 +209,7 @@ def train_optuna(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence) 
 
             mlflow.log_params(best_params)
             mlflow.log_metrics(metrics)
-            mlflow.sklearn.log_model(best_model, artifact_path="model")
+            mlflow.sklearn.log_model(best_model, name="model")
 
             print(f"[train] {name}: RMSE={metrics['rmse']:.2f} | OOF={oof:.2f}")
             results.append({"name": name, "model": best_model, "metrics": metrics})
@@ -217,15 +247,15 @@ def train_lstm(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence) ->
         )
         model.fit(
             Xtr_s, Ytr_s, validation_data=(Xvl_s, Yvl_s),
-            epochs=50, batch_size=64, verbose=0,
-            callbacks=[EarlyStopping(patience=5, restore_best_weights=True)],
+            epochs=20, batch_size=64, verbose=0,
+            callbacks=[EarlyStopping(patience=3, restore_best_weights=True)],
         )
         preds = model.predict(Xvl_s, verbose=0).ravel()
         return float(np.sqrt(mean_squared_error(Yvl_s.ravel(), preds)))
 
     with mlflow.start_run(run_name="LSTM"):
         study = optuna.create_study(direction="minimize")
-        study.optimize(objective, n_trials=30, show_progress_bar=False)
+        study.optimize(objective, n_trials=5, show_progress_bar=False)
         best = study.best_params
         seq_len = best["sequence_length"]
 
@@ -236,8 +266,8 @@ def train_lstm(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence) ->
         Xte_s, Yte_s = to_seq(X_test,  Y_test,  seq_len)
         final_model   = build_lstm(**best, n_features=X_train.shape[1], n_outputs=n_outputs)
         final_model.fit(
-            Xtr_s, Ytr_s, epochs=150, batch_size=64, verbose=0,
-            callbacks=[EarlyStopping(patience=15, restore_best_weights=True)],
+            Xtr_s, Ytr_s, epochs=50, batch_size=64, verbose=0,
+            callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
         )
         test_preds  = final_model.predict(Xte_s, verbose=0).ravel()
         train_preds = final_model.predict(Xtr_s, verbose=0).ravel()
@@ -249,9 +279,9 @@ def train_lstm(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence) ->
 
         mlflow.log_params(best)
         mlflow.log_metrics(metrics)
-        lstm_path = "/tmp/lstm_model"
+        lstm_path = "/tmp/lstm_model.keras"
         final_model.save(lstm_path)
-        mlflow.tensorflow.log_model(final_model, artifact_path="model")
+        mlflow.tensorflow.log_model(final_model, name="model")
 
         print(f"[train] LSTM: RMSE={metrics['rmse']:.2f}")
         return {"name": "LSTM", "model": final_model, "metrics": metrics}
@@ -266,18 +296,6 @@ def build_ensembles(results: list[dict], X_train, Y_train, X_test, Y_test, y_per
     # Voting ensemble (Optuna-tuned weights replaced by 1/RMSE weights for simplicity)
     weights = [1.0 / max(r["metrics"]["rmse"], 1e-6) for r in top3]
     w_norm  = [w / sum(weights) for w in weights]
-
-    class WeightedVoter:
-        def __init__(self, models, weights):
-            self.models  = models
-            self.weights = weights
-        def fit(self, X, Y):
-            for m in self.models:
-                m.fit(X, Y)
-            return self
-        def predict(self, X):
-            preds = np.stack([m.predict(X) for m in self.models], axis=0)
-            return np.einsum("i,ijk->jk", self.weights, preds)
 
     voter = WeightedVoter([r["model"] for r in top3], w_norm)
     voter.fit(X_train, Y_train)
@@ -301,6 +319,40 @@ def compute_shap(best_model, X_test, feature_cols):
         print(f"[train] SHAP values saved to {SHAP_PATH}")
     except Exception as e:
         print(f"[train] SHAP skipped: {e}")
+
+
+# ─── Ablation Feedback ────────────────────────────────────────────────────────
+
+ABLATION_DISABLE_THRESHOLD = -0.5   # drop a group if removing it improves RMSE by >0.5
+ABLATION_REENABLE_THRESHOLD = 0.0   # re-enable a group if it's no longer harmful
+
+_OVERRIDE_PATH = Path(__file__).parent.parent.parent / "feature_groups_override.json"
+
+def _persist_ablation_overrides(deltas: dict):
+    import json
+    from src.config import FEATURE_GROUPS
+
+    overrides = {}
+    if _OVERRIDE_PATH.exists():
+        with open(_OVERRIDE_PATH) as f:
+            overrides = json.load(f)
+
+    changed = []
+    for group, delta in deltas.items():
+        if delta < ABLATION_DISABLE_THRESHOLD and FEATURE_GROUPS.get(group, True):
+            overrides[group] = False
+            changed.append(f"disabled '{group}' (Δ={delta:+.2f})")
+        elif delta >= ABLATION_REENABLE_THRESHOLD and overrides.get(group) is False:
+            overrides[group] = True
+            changed.append(f"re-enabled '{group}' (Δ={delta:+.2f})")
+
+    with open(_OVERRIDE_PATH, "w") as f:
+        json.dump(overrides, f, indent=2)
+
+    if changed:
+        print(f"[ablation] Feature groups updated for next run: {', '.join(changed)}")
+    else:
+        print("[ablation] No feature group changes — all groups performing as expected")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -343,15 +395,15 @@ def main():
 
     # 8. Knowledge distillation
     top3 = sorted(
-        [r for r in all_results if r["name"] in ("RandomForest", "XGBoost", "LightGBM")],
+        [r for r in all_results if r["name"] in ("RandomForest", "XGBoost", "CatBoost")],
         key=lambda r: r["metrics"]["rmse"],
     )[:3]
     if len(top3) == 3:
         student = distill(
             teachers=[r["model"] for r in top3],
             teacher_rmses=[r["metrics"]["rmse"] for r in top3],
-            X_train=X_train, Y_train=Y_train,
-            X_val=X_val, Y_val=Y_val,
+            X_train=X_train, y_train=Y_train,
+            X_val=X_val, y_val=Y_val,
         )
 
         class KerasWrapper:
@@ -370,16 +422,27 @@ def main():
         [r for r in all_results if r["name"] not in ("LSTM", "DistilledMLP")],
         key=lambda r: r["metrics"]["rmse"],
     )[0]
+
+    class _FirstOutputWrapper:
+        def __init__(self, model): self.model = model
+        def predict(self, X): return self.model.predict(X)[:, 0]
+
     try:
-        calibrate(best_non_lstm["model"], X_val, Y_val[:, 0])
+        calibrate(_FirstOutputWrapper(best_non_lstm["model"]), X_val, Y_val[:, 0])
     except Exception as e:
         print(f"[train] Conformal calibration skipped: {e}")
 
-    # 10. SHAP
-    compute_shap(best_non_lstm["model"], X_test, feature_cols)
+    # 10. SHAP — requires a tree-based model
+    _tree_names = ("RandomForest", "XGBoost", "CatBoost", "GradientBoosting")
+    tree_results = [r for r in all_results if r["name"] in _tree_names]
+    if tree_results:
+        best_tree = sorted(tree_results, key=lambda r: r["metrics"]["rmse"])[0]
+        compute_shap(best_tree["model"], X_test, feature_cols)
 
-    # 11. Feature ablation
-    run_ablation(df)
+    # 11. Feature ablation — results feed back into next run's FEATURE_GROUPS
+    ablation_deltas = run_ablation(df)
+    if ablation_deltas:
+        _persist_ablation_overrides(ablation_deltas)
 
     # 12. Register all + Champion-Challenger
     register_all(all_results)

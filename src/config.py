@@ -1,4 +1,6 @@
 import os
+import json
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,6 +32,8 @@ AQI_ALERT_THRESHOLD  = 150   # AQI level that triggers hazardous alert
 
 # ─── Feature Group Toggles ────────────────────────────────────────────────────
 # Set any group to False to drop it — used by ablation study and manual experiments
+_OVERRIDE_PATH = Path(__file__).parent.parent / "feature_groups_override.json"
+
 FEATURE_GROUPS = {
     "time_basic":      True,   # hour, day_of_week, month, season, is_weekend
     "time_fourier":    True,   # hour_sin, hour_cos, month_sin, month_cos
@@ -41,6 +45,11 @@ FEATURE_GROUPS = {
     "raw_pollutants":  True,   # PM2.5, PM10, O3, NO2, SO2, CO (keep True)
     "meteorology":     True,   # temperature, humidity, wind_speed, pressure, etc.
 }
+
+# Apply any persisted ablation overrides (written by training pipeline)
+if _OVERRIDE_PATH.exists():
+    with open(_OVERRIDE_PATH) as _f:
+        FEATURE_GROUPS.update(json.load(_f))
 
 # ─── Drift Thresholds ─────────────────────────────────────────────────────────
 PSI_WARN_THRESHOLD  = 0.1   # moderate drift

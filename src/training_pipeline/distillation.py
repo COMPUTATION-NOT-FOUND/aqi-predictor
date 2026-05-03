@@ -18,7 +18,7 @@ from tensorflow.keras.regularizers import l2
 
 ALPHA        = 0.7   # weight for soft-target loss
 TEMPERATURE  = 2.0   # temperature scaling for soft targets
-STUDENT_PATH = Path(__file__).parent.parent.parent / "distilled_mlp"
+STUDENT_PATH = Path(__file__).parent.parent.parent / "distilled_mlp.keras"
 
 
 def _soft_targets(teachers: list, X: np.ndarray, weights: list) -> np.ndarray:

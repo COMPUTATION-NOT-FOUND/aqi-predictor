@@ -54,11 +54,12 @@ def fetch_training_data(start_time: str = None, end_time: str = None) -> pd.Data
         fv = None
 
     if fv is None:
-        fv = fs.create_feature_view(
+        fs.create_feature_view(
             name=fv_name,
             version=FEATURE_VERSION,
             query=fg.select_all(),
         )
+        fv = fs.get_feature_view(name=fv_name, version=FEATURE_VERSION)
 
     df = fv.get_batch_data(start_time=start_time, end_time=end_time)
     return df.sort_values("timestamp").reset_index(drop=True)

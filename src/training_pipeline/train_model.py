@@ -448,7 +448,17 @@ def main():
         _persist_ablation_overrides(ablation_deltas)
 
     # 12. Register all + Champion-Challenger
-    register_all(all_results)
+    # Keras-based models (LSTM, DistilledMLP) are registered for leaderboard
+    # comparison but excluded from champion promotion — the dashboard runs on
+    # Render without TensorFlow, so the champion must be sklearn-compatible.
+    KERAS_MODELS = {"LSTM", "DistilledMLP"}
+    sklearn_results = [r for r in all_results if r["name"] not in KERAS_MODELS]
+    keras_results   = [r for r in all_results if r["name"] in KERAS_MODELS]
+
+    # Register Keras models with a flag so they appear in leaderboard
+    for r in keras_results:
+        r["metrics"]["champion_eligible"] = 0  # informational only
+    register_all(sklearn_results + keras_results, champion_eligible_names={r["name"] for r in sklearn_results})
 
     # Summary
     print(f"\n{'='*60}")

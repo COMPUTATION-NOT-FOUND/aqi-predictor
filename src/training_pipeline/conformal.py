@@ -45,10 +45,30 @@ def calibrate(model, X_cal: np.ndarray, y_cal: np.ndarray) -> SplitConformalRegr
 
 
 def load_calibrator() -> SplitConformalRegressor:
-    if not CONFORMAL_PATH.exists():
-        return None
-    with open(CONFORMAL_PATH, "rb") as f:
-        return pickle.load(f)
+    if CONFORMAL_PATH.exists():
+        with open(CONFORMAL_PATH, "rb") as f:
+            return pickle.load(f)
+
+    # Fallback: load from champion model artifact in Hopsworks
+    # (needed when running on Render with ephemeral filesystem)
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+        from src.config import HOPSWORKS_API_KEY, HOPSWORKS_PROJECT
+        import hopsworks
+        from pathlib import Path as _Path
+        project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
+        mr = project.get_model_registry()
+        models = mr.get_models(name="aqi_champion")
+        if models:
+            model_dir = models[-1].download()
+            remote_cal = _Path(model_dir) / "conformal_calibrator.pkl"
+            if remote_cal.exists():
+                with open(remote_cal, "rb") as f:
+                    return pickle.load(f)
+    except Exception as e:
+        print(f"[conformal] Could not load calibrator from Hopsworks: {e}")
+    return None
 
 
 def predict_with_intervals(mapie: SplitConformalRegressor, X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

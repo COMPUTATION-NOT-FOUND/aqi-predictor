@@ -23,6 +23,8 @@ from src.config import (
 )
 
 SCALER_PATH = Path(__file__).parent.parent.parent / "scaler_bundle.pkl"
+SHAP_PATH = Path(__file__).parent.parent.parent / "shap_values.pkl"
+CONFORMAL_PATH = Path(__file__).parent.parent.parent / "conformal_calibrator.pkl"
 
 
 def _get_registry():
@@ -33,16 +35,37 @@ def _get_registry():
     return project.get_model_registry()
 
 
+def _is_keras_model(model) -> bool:
+    """Check if a model is a Keras model without importing tensorflow at module level."""
+    try:
+        import tensorflow as tf
+        return isinstance(model, tf.keras.Model)
+    except ImportError:
+        return False
+
+
 def _save_model_artifact(model, name: str, metrics: dict, extra_tags: dict = None) -> object:
-    """Save a model artifact to Hopsworks Model Registry."""
+    """Save a model artifact to Hopsworks Model Registry.
+
+    Keras models are saved in native .keras format (not pickle) so the dashboard
+    can load them without tensorflow — it just needs to detect the file type.
+    sklearn/XGBoost/CatBoost models are saved as model.pkl as before.
+    """
     mr = _get_registry()
     model_dir = Path(f"/tmp/{name}_artifact")
     model_dir.mkdir(exist_ok=True)
 
-    # Save model
-    model_file = model_dir / "model.pkl"
-    with open(model_file, "wb") as f:
-        pickle.dump(model, f)
+    # Save model — Keras uses native format, everything else uses pickle
+    if _is_keras_model(model):
+        model_file = model_dir / "model.keras"
+        model.save(str(model_file))
+        # Write a marker so inference knows which loader to use
+        (model_dir / "model_type.txt").write_text("keras")
+    else:
+        model_file = model_dir / "model.pkl"
+        with open(model_file, "wb") as f:
+            pickle.dump(model, f)
+        (model_dir / "model_type.txt").write_text("sklearn")
 
     # Save metadata
     meta_file = model_dir / "metadata.json"
@@ -61,6 +84,16 @@ def _save_model_artifact(model, name: str, metrics: dict, extra_tags: dict = Non
         import shutil
         shutil.copy(SCALER_PATH, model_dir / "scaler_bundle.pkl")
 
+    # Bundle SHAP values and conformal calibrator so Render can access them
+    # (Render has an ephemeral filesystem — local files written by GitHub Actions
+    #  won't exist there; bundling them in the Hopsworks artifact solves this)
+    if SHAP_PATH.exists():
+        import shutil
+        shutil.copy(SHAP_PATH, model_dir / "shap_values.pkl")
+    if CONFORMAL_PATH.exists():
+        import shutil
+        shutil.copy(CONFORMAL_PATH, model_dir / "conformal_calibrator.pkl")
+
     hw_model = mr.python.create_model(
         name=name,
         metrics=metrics,
@@ -71,7 +104,7 @@ def _save_model_artifact(model, name: str, metrics: dict, extra_tags: dict = Non
     return hw_model
 
 
-def register_all(models_with_metrics: list[dict]) -> dict:
+def register_all(models_with_metrics: list[dict], champion_eligible_names: set = None) -> dict:
     """
     Save all trained models to Hopsworks.
     Applies Champion-Challenger logic to determine which model is promoted.
@@ -79,6 +112,9 @@ def register_all(models_with_metrics: list[dict]) -> dict:
     Args:
         models_with_metrics: list of dicts with keys:
           name, model, metrics (dict with 'rmse', 'oof_rmse', etc.), test_rmse
+        champion_eligible_names: set of model names allowed to compete for champion.
+          Defaults to all models. Pass a set to exclude Keras/LSTM models that
+          can't be deployed on Render without TensorFlow.
 
     Returns:
         dict with champion model info.
@@ -104,7 +140,7 @@ def register_all(models_with_metrics: list[dict]) -> dict:
         is_frozen = False
         print("[register] No existing champion found — first run")
 
-    # Save all models
+    # Save all models; only eligible ones compete for champion slot
     champion_candidate = None
     best_challenger_rmse = np.inf
 
@@ -113,11 +149,13 @@ def register_all(models_with_metrics: list[dict]) -> dict:
         model       = entry["model"]
         metrics     = entry["metrics"]
         test_rmse   = float(metrics.get("rmse", 999))
+        eligible    = champion_eligible_names is None or name in champion_eligible_names
 
-        print(f"[register] Saving {name} (test RMSE={test_rmse:.2f})")
+        print(f"[register] Saving {name} (test RMSE={test_rmse:.2f})"
+              + ("" if eligible else " [champion-ineligible: Keras/not sklearn-compatible]"))
         _save_model_artifact(model, name, metrics)
 
-        if test_rmse < best_challenger_rmse:
+        if eligible and test_rmse < best_challenger_rmse:
             best_challenger_rmse = test_rmse
             champion_candidate   = entry
 

@@ -24,7 +24,13 @@ SHAP_PATH = Path(__file__).parent.parent.parent / "shap_values.pkl"
 
 
 def load_champion_model():
-    """Download and load the champion model from Hopsworks Model Registry."""
+    """Download and load the champion model from Hopsworks Model Registry.
+
+    Supports two formats written by register_model._save_model_artifact:
+      - model.pkl   → sklearn/XGBoost/CatBoost (no keras needed)
+      - model.keras → Keras MLP student (requires tensorflow)
+    A model_type.txt marker file tells us which format to expect.
+    """
     import traceback
     print(f"[inference] Connecting to Hopsworks project='{HOPSWORKS_PROJECT}' key={'SET' if HOPSWORKS_API_KEY else 'MISSING'}")
     try:
@@ -45,14 +51,33 @@ def load_champion_model():
         best = models[-1]
         print(f"[inference] Found aqi_champion v{best.version} — downloading...")
         model_dir = best.download()
-        with open(f"{model_dir}/model.pkl", "rb") as f:
-            model = pickle.load(f)
+
+        # Detect model format via marker written at training time
+        type_file = Path(model_dir) / "model_type.txt"
+        model_type = type_file.read_text().strip() if type_file.exists() else "sklearn"
+
+        if model_type == "keras":
+            # Keras MLP distilled student
+            try:
+                import tensorflow as tf
+                model = tf.keras.models.load_model(f"{model_dir}/model.keras")
+                print("[inference] Champion Keras model loaded successfully")
+            except ImportError:
+                print("[inference] CHAMPION LOAD FAILED: champion is a Keras model but tensorflow "
+                      "is not installed on Render. Add tensorflow to requirements-dashboard.txt, "
+                      "or re-run training so a sklearn/XGBoost model wins the champion slot.")
+                return None, None
+        else:
+            # sklearn / XGBoost / CatBoost — safe to unpickle without keras
+            with open(f"{model_dir}/model.pkl", "rb") as f:
+                model = pickle.load(f)
+            print("[inference] Champion sklearn model loaded successfully")
+
         scaler_path = Path(model_dir) / "scaler_bundle.pkl"
         scaler = None
         if scaler_path.exists():
             with open(scaler_path, "rb") as f:
                 scaler = pickle.load(f)
-        print("[inference] Champion model loaded successfully")
         return model, scaler
     except Exception as e:
         print(f"[inference] CHAMPION LOAD FAILED: {e}\n{traceback.format_exc()}")
@@ -142,31 +167,66 @@ def predict_3day(
 
 
 def load_shap_data() -> dict:
-    """Load pre-computed SHAP values from the last training run."""
+    """Load pre-computed SHAP values.
+
+    Tries local file first (fast, works in dev). Falls back to Hopsworks
+    model artifact so Render (ephemeral filesystem) can access it.
+    """
     if SHAP_PATH.exists():
         with open(SHAP_PATH, "rb") as f:
             return pickle.load(f)
+
+    # Fallback: download shap_values.pkl bundled alongside champion model artifact
+    try:
+        project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
+        mr = project.get_model_registry()
+        models = mr.get_models(name="aqi_champion")
+        if models:
+            model_dir = models[-1].download()
+            shap_remote = Path(model_dir) / "shap_values.pkl"
+            if shap_remote.exists():
+                with open(shap_remote, "rb") as f:
+                    return pickle.load(f)
+    except Exception as e:
+        print(f"[inference] Could not load SHAP from Hopsworks: {e}")
     return {}
 
 
 def load_all_models_metadata() -> list[dict]:
-    """Fetch metadata for all registered models (for the leaderboard)."""
+    """Fetch metadata for all registered models (for the leaderboard).
+
+    NOTE: Hopsworks SDK 4.7 changed get_models() to require a 'name' argument.
+    We iterate over all known model names instead of calling get_models() bare.
+    """
+    # All names that the training pipeline ever registers
+    KNOWN_MODEL_NAMES = [
+        "aqi_champion",
+        "Ridge", "Lasso", "ElasticNet",
+        "RandomForest", "GradientBoosting",
+        "XGBoost", "CatBoost",
+        "LSTM", "distilled_student",
+    ]
     try:
         project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
         mr = project.get_model_registry()
-        all_models = mr.get_models()
         results = []
-        for m in all_models:
-            results.append({
-                "name":        m.name,
-                "version":     m.version,
-                "rmse":        m.training_metrics.get("rmse", None) if m.training_metrics else None,
-                "ioa":         m.training_metrics.get("ioa",  None) if m.training_metrics else None,
-                "skill_score": m.training_metrics.get("skill_score", None) if m.training_metrics else None,
-                "oof_rmse":    m.training_metrics.get("oof_rmse", None) if m.training_metrics else None,
-                "overfit":     bool(m.training_metrics.get("overfit_flag", 0)) if m.training_metrics else False,
-                "is_champion": m.name == "aqi_champion",
-            })
-        return results
+        for model_name in KNOWN_MODEL_NAMES:
+            try:
+                models = mr.get_models(name=model_name)  # 4.7 requires name kwarg
+                for m in (models or []):
+                    results.append({
+                        "name":        m.name,
+                        "version":     m.version,
+                        "rmse":        m.training_metrics.get("rmse", None) if m.training_metrics else None,
+                        "ioa":         m.training_metrics.get("ioa",  None) if m.training_metrics else None,
+                        "skill_score": m.training_metrics.get("skill_score", None) if m.training_metrics else None,
+                        "oof_rmse":    m.training_metrics.get("oof_rmse", None) if m.training_metrics else None,
+                        "overfit":     bool(m.training_metrics.get("overfit_flag", 0)) if m.training_metrics else False,
+                        "is_champion": m.name == "aqi_champion",
+                    })
+            except Exception:
+                # Model name simply doesn't exist in registry yet — skip silently
+                pass
+        return results if results else [{"name": "No models registered yet", "version": "-", "status": "challenger"}]
     except Exception as e:
         return [{"name": f"Error loading models: {e}", "version": "-"}]

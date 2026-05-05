@@ -25,16 +25,25 @@ SHAP_PATH = Path(__file__).parent.parent.parent / "shap_values.pkl"
 
 def load_champion_model():
     """Download and load the champion model from Hopsworks Model Registry."""
-    project = hopsworks.login(
-        api_key_value=HOPSWORKS_API_KEY,  # FILL IN: HOPSWORKS_API_KEY in .env
-        project=HOPSWORKS_PROJECT,
-    )
+    import traceback
+    print(f"[inference] Connecting to Hopsworks project='{HOPSWORKS_PROJECT}' key={'SET' if HOPSWORKS_API_KEY else 'MISSING'}")
+    try:
+        project = hopsworks.login(
+            api_key_value=HOPSWORKS_API_KEY,
+            project=HOPSWORKS_PROJECT,
+        )
+    except Exception as e:
+        print(f"[inference] HOPSWORKS LOGIN FAILED: {e}\n{traceback.format_exc()}")
+        return None, None
+
     mr = project.get_model_registry()
     try:
         models = mr.get_models(name="aqi_champion")
         if not models:
+            print("[inference] No 'aqi_champion' model found in registry")
             return None, None
         best = models[-1]
+        print(f"[inference] Found aqi_champion v{best.version} — downloading...")
         model_dir = best.download()
         with open(f"{model_dir}/model.pkl", "rb") as f:
             model = pickle.load(f)
@@ -43,9 +52,10 @@ def load_champion_model():
         if scaler_path.exists():
             with open(scaler_path, "rb") as f:
                 scaler = pickle.load(f)
+        print("[inference] Champion model loaded successfully")
         return model, scaler
     except Exception as e:
-        print(f"[inference] Could not load champion from Hopsworks: {e}")
+        print(f"[inference] CHAMPION LOAD FAILED: {e}\n{traceback.format_exc()}")
         return None, None
 
 

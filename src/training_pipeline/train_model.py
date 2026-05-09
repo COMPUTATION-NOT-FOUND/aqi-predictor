@@ -47,6 +47,7 @@ from src.feature_pipeline.drift_monitor import save_baseline
 from src.training_pipeline.models import (
     CLASSICAL_MODELS, OPTUNA_MODELS, build_lstm, lstm_suggest,
 )
+from sklearn.ensemble import StackingRegressor
 from src.training_pipeline.evaluate_model import evaluate_all, overfitting_flag
 from src.training_pipeline.distillation import distill
 from src.training_pipeline.conformal import calibrate
@@ -304,7 +305,7 @@ def build_ensembles(results: list[dict], X_train, Y_train, X_test, Y_test, y_per
     sorted_r = sorted(results, key=lambda r: r["metrics"]["rmse"])
     top3     = sorted_r[:3]
 
-    # Voting ensemble (Optuna-tuned weights replaced by 1/RMSE weights for simplicity)
+    # Voting ensemble (1/RMSE weights)
     weights = [1.0 / max(r["metrics"]["rmse"], 1e-6) for r in top3]
     w_norm  = [w / sum(weights) for w in weights]
 
@@ -312,9 +313,30 @@ def build_ensembles(results: list[dict], X_train, Y_train, X_test, Y_test, y_per
     voter.fit(X_train, Y_train)
     test_preds = voter.predict(X_test).ravel()
     v_metrics  = evaluate_all(Y_test.ravel(), test_preds, y_persistence)
-    v_metrics["oof_rmse"] = v_metrics["rmse"]   # proxy
+    v_metrics["oof_rmse"] = v_metrics["rmse"]
     ensemble_results = [{"name": "VotingEnsemble", "model": voter, "metrics": v_metrics}]
-    print(f"[train] VotingEnsemble: RMSE={v_metrics['rmse']:.2f}")
+    print(f"[train] VotingEnsemble: RMSE={v_metrics['rmse']:.2f} | IoA={v_metrics.get('ioa', 0):.3f}")
+
+    # Stacking ensemble — MultiOutputRegressor wrapping a Ridge-meta stacker
+    try:
+        from sklearn.linear_model import Ridge as _Ridge
+        estimators = [(r["name"], _FirstOutputWrapper(r["model"])) for r in top3]
+        stacker = MultiOutputRegressor(
+            StackingRegressor(
+                estimators=estimators,
+                final_estimator=_Ridge(alpha=1.0),
+                cv=3,
+            ),
+            n_jobs=1,
+        )
+        stacker.fit(X_train, Y_train)
+        stack_preds = stacker.predict(X_test).ravel()
+        st_metrics  = evaluate_all(Y_test.ravel(), stack_preds, y_persistence)
+        st_metrics["oof_rmse"] = st_metrics["rmse"]
+        ensemble_results.append({"name": "StackingEnsemble", "model": stacker, "metrics": st_metrics})
+        print(f"[train] StackingEnsemble: RMSE={st_metrics['rmse']:.2f} | IoA={st_metrics.get('ioa', 0):.3f}")
+    except Exception as e:
+        print(f"[train] StackingEnsemble skipped: {e}")
 
     return ensemble_results
 
@@ -404,9 +426,10 @@ def main():
     )
     all_results += ensemble_results
 
-    # 8. Knowledge distillation
+    # 8. Knowledge distillation — prefer LightGBM over CatBoost when available
+    _DISTILL_CANDIDATES = ("RandomForest", "XGBoost", "LightGBM", "CatBoost")
     top3 = sorted(
-        [r for r in all_results if r["name"] in ("RandomForest", "XGBoost", "CatBoost")],
+        [r for r in all_results if r["name"] in _DISTILL_CANDIDATES],
         key=lambda r: r["metrics"]["rmse"],
     )[:3]
     if len(top3) == 3:

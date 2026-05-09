@@ -81,7 +81,7 @@ aqi-predictor/
 │   │   ├── backfill_features.py   # Seed historical data (run once)
 │   │   └── ablation_backfill.py   # Compare 5 imputation strategies
 │   ├── training_pipeline/
-│   │   ├── models.py              # 12 model definitions + search spaces
+│   │   ├── models.py              # 14 model definitions + search spaces
 │   │   ├── train_model.py         # Main training loop
 │   │   ├── evaluate_model.py      # RMSE, MAE, R², IoA, Skill Score
 │   │   ├── distillation.py        # Ensemble → lightweight MLP
@@ -90,13 +90,13 @@ aqi-predictor/
 │   │   └── register_model.py      # Champion-Challenger + Hopsworks push
 │   └── dashboard/
 │       ├── app.py                 # Multi-tab Plotly Dash app
-│       ├── inference.py           # Load model + predict
+│       ├── inference.py           # Load model (cached) + predict
 │       └── components/
 │           ├── forecast_chart.py  # 3-day forecast with uncertainty bands
 │           ├── gauge.py           # AQI gauge
 │           ├── leaderboard.py     # Model registry table
 │           ├── shap_plot.py       # SHAP explainability
-│           ├── alerts.py         # Hazardous AQI banner
+│           ├── alerts.py          # Hazardous AQI banner
 │           ├── drift_tab.py       # PSI drift heatmap
 │           └── ablation_tab.py    # Self-maintained ablation dashboard
 ├── notebooks/
@@ -114,7 +114,7 @@ aqi-predictor/
 ## Dashboard Tabs
 
 1. **Live Forecast** — Current AQI gauge, 3-day forecast with uncertainty bands, hazardous alert
-2. **Model Leaderboard** — All 13 models ranked by RMSE; freeze/rollback controls
+2. **Model Leaderboard** — All models ranked by RMSE; freeze/rollback controls
 3. **Ablation Study** — Auto-updated charts: which features matter, which backfill strategy wins
 4. **SHAP Explainability** — Why the model predicted what it predicted
 5. **Data Drift** — PSI per feature over time; alerts when distribution shifts
@@ -125,10 +125,10 @@ aqi-predictor/
 
 | Model | Type |
 |---|---|
-| Ridge, Lasso, ElasticNet, SVR | Classical |
+| Ridge, Lasso, ElasticNet | Classical Linear |
 | Random Forest, Gradient Boosting | Classical Ensemble |
-| XGBoost, LightGBM, CatBoost | Boosting |
-| Stacking, Voting Ensemble | Hybrid |
+| XGBoost, LightGBM, CatBoost | Gradient Boosting |
+| Voting Ensemble, Stacking Ensemble | Hybrid Ensemble |
 | LSTM | Deep Learning |
 | Distilled MLP | Knowledge Distillation (deployed) |
 
@@ -137,8 +137,20 @@ aqi-predictor/
 ## Key Design Decisions
 
 - **Ground truth**: AQI computed from raw PM2.5 using the US EPA linear interpolation formula
-- **Loss function**: MSE (penalizes large AQI spikes heavily — important for public health)
+- **Loss function**: Huber loss for gradient boosters (XGBoost, LightGBM, CatBoost) and LSTM — robust to AQI spike outliers that inflate MSE and suppress IoA
 - **Forecasting**: MIMO (direct multi-output) — predicts 24h/48h/72h simultaneously, avoids error accumulation
+- **Features**: 50+ engineered features including multi-scale lags (1h–168h / 7-day), rolling statistics (mean, std, min, max over 24h), STL decomposition, physics-derived and cross features
 - **Normalization**: log(x+1) → RobustScaler for skewed pollutants; scaler fitted on training data only
-- **Model protection**: Champion-Challenger gate (new model must beat champion by ≥3% RMSE)
-- **Deployed model**: Distilled MLP (fast inference; knowledge from top-3 ensemble teachers)
+- **Model protection**: Champion-Challenger gate — new model must beat champion by ≥3% RMSE **and** have IoA ≥ 0.40 (prevents a mean-predicting model from holding the champion slot)
+- **Deployed model**: Distilled MLP (fast inference; knowledge distilled from top-3 tree ensemble teachers)
+
+---
+
+## Performance Notes
+
+### Dashboard speed on Render free tier
+- **Cold starts (~30–50 s)** are unavoidable on the free tier — containers spin down after 15 min of inactivity
+- **In-session performance** is fast: the champion model is downloaded from Hopsworks once per container lifecycle and cached in memory. Subsequent tab switches and 5-minute refresh intervals skip the download entirely
+
+### Why IoA matters alongside RMSE
+RMSE-minimising models can "win" by predicting close to the mean — low error but zero predictive value. IoA (Index of Agreement, Willmott 1981) measures how well the model tracks actual AQI movements. IoA = 1.0 is perfect; IoA < 0.5 means the model is worse than predicting the mean. The champion promotion gate requires IoA ≥ 0.40 to prevent low-IoA models from being deployed.

@@ -140,6 +140,8 @@ def register_all(models_with_metrics: list[dict], champion_eligible_names: set =
         is_frozen = False
         print("[register] No existing champion found — first run")
 
+    MIN_CHAMPION_IOA = 0.40   # models below this IoA cannot become champion
+
     # Save all models; only eligible ones compete for champion slot
     champion_candidate = None
     best_challenger_rmse = np.inf
@@ -149,10 +151,16 @@ def register_all(models_with_metrics: list[dict], champion_eligible_names: set =
         model       = entry["model"]
         metrics     = entry["metrics"]
         test_rmse   = float(metrics.get("rmse", 999))
+        candidate_ioa = float(metrics.get("ioa", 0))
         eligible    = champion_eligible_names is None or name in champion_eligible_names
 
-        print(f"[register] Saving {name} (test RMSE={test_rmse:.2f})"
-              + ("" if eligible else " [champion-ineligible: Keras/not sklearn-compatible]"))
+        if eligible and candidate_ioa < MIN_CHAMPION_IOA:
+            print(f"[register] {name} blocked from champion slot: IoA={candidate_ioa:.3f} < {MIN_CHAMPION_IOA} "
+                  f"(model predicts too close to mean — Huber loss or more data needed)")
+            eligible = False
+
+        print(f"[register] Saving {name} (test RMSE={test_rmse:.2f}, IoA={candidate_ioa:.3f})"
+              + ("" if eligible else " [champion-ineligible]"))
         _save_model_artifact(model, name, metrics)
 
         if eligible and test_rmse < best_challenger_rmse:

@@ -99,11 +99,23 @@ def compute_lag_features(history: pd.DataFrame) -> dict:
         lags[f"aqi_lag_{h}h"]  = safe_get(aqi_series, -h - 1)
         lags[f"pm25_lag_{h}h"] = safe_get(pm25_series, -h - 1)
 
+    # Extended lags: 48h, 72h, 168h (7-day) — weekly pollution patterns
+    for h in [48, 72, 168]:
+        lags[f"aqi_lag_{h}h"] = safe_get(aqi_series, -h - 1)
+
     n = len(aqi_series)
     lags["rolling_mean_3h"]  = float(np.mean(aqi_series[-min(3, n):])) if n > 0 else 0.0
     lags["rolling_mean_6h"]  = float(np.mean(aqi_series[-min(6, n):])) if n > 0 else 0.0
     lags["rolling_mean_24h"] = float(np.mean(aqi_series[-min(24, n):])) if n > 0 else 0.0
     lags["rolling_std_24h"]  = float(np.std(aqi_series[-min(24, n):])) if n > 0 else 0.0
+    # Range features: explicit volatility bounds the model can learn from
+    window_24 = aqi_series[-min(24, n):]
+    lags["rolling_min_24h"]  = float(np.min(window_24)) if n > 0 else 0.0
+    lags["rolling_max_24h"]  = float(np.max(window_24)) if n > 0 else 0.0
+    # Percentage change: day-over-day trend direction
+    prev_24h = safe_get(aqi_series, -25)
+    curr     = safe_get(aqi_series, -1)
+    lags["aqi_pct_change_24h"] = (curr - prev_24h) / max(abs(prev_24h), 1.0)
 
     lags["aqi_change_rate"]   = safe_get(aqi_series, -1) - safe_get(aqi_series, -2)
     lags["pressure_anomaly"]  = (
@@ -180,8 +192,11 @@ def build_feature_row(raw: dict, history: pd.DataFrame, ts: datetime) -> dict:
             for h in [1, 3, 6, 12, 24]:
                 row[f"aqi_lag_{h}h"]  = lf[f"aqi_lag_{h}h"]
                 row[f"pm25_lag_{h}h"] = lf[f"pm25_lag_{h}h"]
+            for h in [48, 72, 168]:
+                row[f"aqi_lag_{h}h"] = lf[f"aqi_lag_{h}h"]
         if FEATURE_GROUPS["rolling_stats"]:
-            for k in ["rolling_mean_3h", "rolling_mean_6h", "rolling_mean_24h", "rolling_std_24h"]:
+            for k in ["rolling_mean_3h", "rolling_mean_6h", "rolling_mean_24h", "rolling_std_24h",
+                      "rolling_min_24h", "rolling_max_24h", "aqi_pct_change_24h"]:
                 row[k] = lf[k]
         if FEATURE_GROUPS["cross_feature"]:
             row["aqi_change_rate"]  = lf["aqi_change_rate"]

@@ -1,5 +1,5 @@
 # Dashboard-only requirements for Render deployment
-# Excludes tensorflow, optuna, lightgbm, mrmr-selection (training-only)
+# Excludes tensorflow, optuna, mrmr-selection (training-only)
 
 # Server
 gunicorn>=21.2.0
@@ -23,6 +23,7 @@ mlflow>=2.11.0
 scikit-learn>=1.4.0
 xgboost>=2.0.0
 catboost>=1.2.0
+lightgbm>=4.3.0
 
 # Explainability
 shap>=0.44.0

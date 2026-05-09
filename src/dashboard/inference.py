@@ -22,6 +22,13 @@ from src.training_pipeline.conformal import load_calibrator, predict_with_interv
 
 SHAP_PATH = Path(__file__).parent.parent.parent / "shap_values.pkl"
 
+# Module-level caches — survive across Dash callbacks within one container lifecycle.
+# _MODEL_CACHE    : champion model + scaler (never expires; model only changes on re-deploy)
+# _FEATURES_CACHE : recent feature history (expires after 10 min to pick up new hourly rows)
+_MODEL_CACHE: dict = {"model": None, "scaler": None}
+_FEATURES_CACHE: dict = {"data": None, "city": None, "ts": None}
+_FEATURES_CACHE_TTL = 3600  # seconds — matches hourly pipeline cadence; no point refreshing sooner
+
 
 def load_champion_model():
     """Download and load the champion model from Hopsworks Model Registry.
@@ -31,6 +38,10 @@ def load_champion_model():
       - model.keras → Keras MLP student (requires tensorflow)
     A model_type.txt marker file tells us which format to expect.
     """
+    if _MODEL_CACHE["model"] is not None:
+        print("[inference] Returning cached champion model (skipping Hopsworks download)")
+        return _MODEL_CACHE["model"], _MODEL_CACHE["scaler"]
+
     import traceback
     print(f"[inference] Connecting to Hopsworks project='{HOPSWORKS_PROJECT}' key={'SET' if HOPSWORKS_API_KEY else 'MISSING'}")
     try:
@@ -69,15 +80,23 @@ def load_champion_model():
                 return None, None
         else:
             # sklearn / XGBoost / CatBoost — safe to unpickle without keras
-            with open(f"{model_dir}/model.pkl", "rb") as f:
-                model = pickle.load(f)
-            print("[inference] Champion sklearn model loaded successfully")
+            try:
+                with open(f"{model_dir}/model.pkl", "rb") as f:
+                    model = pickle.load(f)
+                print("[inference] Champion sklearn model loaded successfully")
+            except (ImportError, ModuleNotFoundError) as e:
+                print(f"[inference] CHAMPION LOAD FAILED: pickle references a missing package ({e}). "
+                      "Re-run training so a pure sklearn/XGBoost/LightGBM/CatBoost model wins "
+                      "the champion slot, then deploy the updated code.")
+                return None, None
 
         scaler_path = Path(model_dir) / "scaler_bundle.pkl"
         scaler = None
         if scaler_path.exists():
             with open(scaler_path, "rb") as f:
                 scaler = pickle.load(f)
+        _MODEL_CACHE["model"]  = model
+        _MODEL_CACHE["scaler"] = scaler
         return model, scaler
     except Exception as e:
         print(f"[inference] CHAMPION LOAD FAILED: {e}\n{traceback.format_exc()}")
@@ -85,11 +104,32 @@ def load_champion_model():
 
 
 def get_recent_features(city: str = DEFAULT_CITY, n: int = 72) -> pd.DataFrame:
-    """Fetch the most recent n feature rows for the given city."""
+    """Fetch the most recent n feature rows for the given city.
+
+    Results are cached for _FEATURES_CACHE_TTL seconds so that repeated
+    Dash callbacks (tab switches, 5-min refresh) don't re-query Hopsworks.
+    """
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    cached = _FEATURES_CACHE
+    if (
+        cached["data"] is not None
+        and cached["city"] == city
+        and cached["ts"] is not None
+        and (now - cached["ts"]).total_seconds() < _FEATURES_CACHE_TTL
+    ):
+        print("[inference] Returning cached feature history")
+        return cached["data"]
+
+    print("[inference] Fetching feature history from Hopsworks...")
     df = fetch_training_data()
     if "city" in df.columns:
         df = df[df["city"] == city]
-    return df.tail(n)
+    result = df.tail(n)
+    _FEATURES_CACHE["data"] = result
+    _FEATURES_CACHE["city"] = city
+    _FEATURES_CACHE["ts"]   = now
+    return result
 
 
 def predict_3day(

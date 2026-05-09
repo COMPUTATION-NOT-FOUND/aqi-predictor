@@ -8,6 +8,7 @@ from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.multioutput import MultiOutputRegressor
 from xgboost import XGBRegressor
 from catboost import CatBoostRegressor
+from lightgbm import LGBMRegressor
 import optuna
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -91,11 +92,24 @@ def cat_suggest(trial: optuna.Trial) -> dict:
     }
 
 
+def lgbm_suggest(trial: optuna.Trial) -> dict:
+    return {
+        "n_estimators":       trial.suggest_int("n_estimators", 100, 400),
+        "max_depth":          trial.suggest_int("max_depth", 3, 9),
+        "learning_rate":      trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+        "subsample":          trial.suggest_float("subsample", 0.5, 1.0),
+        "colsample_bytree":   trial.suggest_float("colsample_bytree", 0.4, 1.0),
+        "reg_alpha":          trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+        "reg_lambda":         trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+        "min_child_samples":  trial.suggest_int("min_child_samples", 5, 50),
+    }
+
+
 OPTUNA_MODELS = [
     {
         "name":    "XGBoost",
         "factory": lambda params: MultiOutputRegressor(XGBRegressor(
-            objective="reg:squarederror", random_state=42,
+            objective="reg:pseudohubererror", random_state=42,
             verbosity=0, **params,
         ), n_jobs=1),
         "suggest": xgb_suggest,
@@ -104,11 +118,20 @@ OPTUNA_MODELS = [
     {
         "name":    "CatBoost",
         "factory": lambda params: MultiOutputRegressor(CatBoostRegressor(
-            loss_function="RMSE", random_seed=42,
+            loss_function="Huber:delta=1", random_seed=42,
             verbose=0, **params,
         ), n_jobs=1),
         "suggest": cat_suggest,
-        "n_trials": 5,
+        "n_trials": 15,
+    },
+    {
+        "name":    "LightGBM",
+        "factory": lambda params: MultiOutputRegressor(LGBMRegressor(
+            objective="huber", alpha=0.9, random_state=42,
+            verbosity=-1, **params,
+        ), n_jobs=1),
+        "suggest": lgbm_suggest,
+        "n_trials": 20,
     },
 ]
 
@@ -130,7 +153,7 @@ def build_lstm(units=64, dropout=0.2, learning_rate=1e-3, sequence_length=24, n_
         Dense(32, activation="relu"),
         Dense(n_outputs),
     ])
-    model.compile(optimizer=Adam(learning_rate=learning_rate), loss="mse")
+    model.compile(optimizer=Adam(learning_rate=learning_rate), loss="huber")
     return model
 
 

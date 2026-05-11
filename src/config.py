@@ -22,7 +22,7 @@ DEFAULT_LON     = float(os.getenv("DEFAULT_LON", "67.0011"))   # Karachi longitu
 # ─── Pipeline Config ──────────────────────────────────────────────────────────
 BACKFILL_DAYS        = int(os.getenv("BACKFILL_DAYS", "180"))   # FILL IN: history depth in days
 FORECAST_HOURS       = [24, 48, 72]                             # 3-day forecast targets
-FEATURE_VERSION      = 1
+FEATURE_VERSION      = 2  # bumped from 1 — v2 adds aqi_lag_48/72/168h, rolling_min/max_24h, aqi_pct_change_24h
 HOPSWORKS_FG_NAME    = "aqi_features"
 HOPSWORKS_FV_NAME    = "aqi_feature_view"
 

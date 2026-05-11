@@ -2,7 +2,7 @@
 Pearls AQI Predictor — Plotly Dash Dashboard
 5 tabs: Live Forecast | Model Leaderboard | Ablation Study | SHAP | Data Drift
 
-Run locally:  python src/dashboard/app.py
+Run locally:  ./run_local.sh
 Deploy:       Render free tier (see README.md Step 9)
 """
 import dash
@@ -25,10 +25,25 @@ from src.dashboard.components.ablation_tab import build_ablation_charts
 app = dash.Dash(
     __name__,
     external_stylesheets=[dbc.themes.CYBORG, dbc.icons.FONT_AWESOME],
-    title="Pearls AQI Predictor",
+    title="AQI Predictor",
     suppress_callback_exceptions=True,
 )
 server = app.server   # expose Flask server for Render/Gunicorn
+
+# ─── Shared loading spinner ───────────────────────────────────────────────────
+_SPINNER = dbc.Spinner(
+    color="primary",
+    spinner_style={"width": "3rem", "height": "3rem"},
+)
+
+_LOADING_DIV = html.Div(
+    [_SPINNER,
+     html.P("Loading data from Hopsworks…",
+            style={"color": "#a6adc8", "marginTop": "16px", "fontSize": "0.9rem"})],
+    style={"display": "flex", "flexDirection": "column",
+           "alignItems": "center", "justifyContent": "center",
+           "minHeight": "40vh"},
+)
 
 # ─── Layout ───────────────────────────────────────────────────────────────────
 app.layout = dbc.Container(
@@ -37,7 +52,7 @@ app.layout = dbc.Container(
     children=[
         # Header
         dbc.Row(dbc.Col(html.Div([
-            html.H2("Pearls AQI Predictor", className="mb-0",
+            html.H2("AQI Predictor", className="mb-0",
                     style={"color": "#cdd6f4", "fontWeight": "700"}),
             html.Small(f"City: {DEFAULT_CITY.title()} • Updates every hour",
                        style={"color": "#a6adc8"}),
@@ -52,43 +67,106 @@ app.layout = dbc.Container(
             active_tab="tab-forecast",
             style={"backgroundColor": "#181825", "borderBottom": "1px solid #313244"},
             children=[
-                dbc.Tab(label="Live Forecast",     tab_id="tab-forecast"),
-                dbc.Tab(label="Leaderboard",       tab_id="tab-leaderboard"),
-                dbc.Tab(label="Ablation Study",    tab_id="tab-ablation"),
-                dbc.Tab(label="Feature Importance",tab_id="tab-shap"),
-                dbc.Tab(label="Data Drift",        tab_id="tab-drift"),
+                dbc.Tab(label="Live Forecast",      tab_id="tab-forecast"),
+                dbc.Tab(label="Leaderboard",        tab_id="tab-leaderboard"),
+                dbc.Tab(label="Ablation Study",     tab_id="tab-ablation"),
+                dbc.Tab(label="Feature Importance", tab_id="tab-shap"),
+                dbc.Tab(label="Data Drift",         tab_id="tab-drift"),
             ],
         ),
 
-        # Tab content
+        # Tab skeleton — rendered instantly; content filled by callback below
         html.Div(id="tab-content", style={"padding": "24px 28px"}),
+
+        # Hidden trigger: fires once immediately after page load to populate forecast
+        dcc.Store(id="tab-trigger"),
     ],
 )
 
-# ─── Callbacks ────────────────────────────────────────────────────────────────
+# ─── Tab skeleton (instant render) ────────────────────────────────────────────
 
 @app.callback(
     Output("tab-content", "children"),
     Input("main-tabs", "active_tab"),
     Input("interval-refresh", "n_intervals"),
 )
-def render_tab(active_tab, _):
+def render_tab_skeleton(active_tab, _):
+    """Render the tab shell immediately with a loading spinner.
+
+    Each tab that requires Hopsworks data is split into:
+      1. This callback → returns the shell + dcc.Loading wrapper instantly
+      2. A second callback (below) → fills in the real content asynchronously
+    """
     if active_tab == "tab-forecast":
-        return _render_forecast()
+        return html.Div([
+            dcc.Loading(
+                id="forecast-loading",
+                type="circle",
+                color="#89b4fa",
+                children=html.Div(id="forecast-content"),
+            ),
+        ])
     elif active_tab == "tab-leaderboard":
-        return _render_leaderboard()
+        return html.Div([
+            dcc.Loading(
+                id="leaderboard-loading",
+                type="circle",
+                color="#89b4fa",
+                children=html.Div(id="leaderboard-content"),
+            ),
+        ])
     elif active_tab == "tab-ablation":
+        # Ablation reads only MLflow (local files) — no loading state needed
         return _render_ablation()
     elif active_tab == "tab-shap":
-        return _render_shap()
+        return html.Div([
+            dcc.Loading(
+                id="shap-loading",
+                type="circle",
+                color="#89b4fa",
+                children=html.Div(id="shap-content"),
+            ),
+        ])
     elif active_tab == "tab-drift":
+        # Drift reads local log file — fast, no loading state needed
         return _render_drift()
     return html.Div("Unknown tab")
 
 
+# ─── Deferred content callbacks (these do the heavy Hopsworks work) ───────────
+
+@app.callback(
+    Output("forecast-content", "children"),
+    Input("forecast-content", "id"),   # fires once when element mounts
+)
+def fill_forecast(_):
+    return _render_forecast()
+
+
+@app.callback(
+    Output("leaderboard-content", "children"),
+    Input("leaderboard-content", "id"),
+)
+def fill_leaderboard(_):
+    return _render_leaderboard()
+
+
+@app.callback(
+    Output("shap-content", "children"),
+    Input("shap-content", "id"),
+)
+def fill_shap(_):
+    return _render_shap()
+
+
+# ─── Render helpers ───────────────────────────────────────────────────────────
+
 def _render_forecast():
     from src.dashboard.inference import predict_3day, get_recent_features
-    result = predict_3day()
+    try:
+        result = predict_3day()
+    except Exception as e:
+        result = {"error": str(e)}
 
     current = result.get("current_aqi", 0)
     a24     = result.get("aqi_24h", current)
@@ -104,21 +182,15 @@ def _render_forecast():
         history = None
 
     return dbc.Container(fluid=True, children=[
-        # Alert banner (only if hazardous)
         build_alert_banner(max(current, a24, a48, a72)),
 
         dbc.Row([
-            # Gauge — current AQI
-            dbc.Col(dcc.Graph(figure=build_gauge(current, "Current AQI"), config={"displayModeBar": False}), md=3),
-            # Gauge — 24h forecast
-            dbc.Col(dcc.Graph(figure=build_gauge(a24, "24h Forecast"), config={"displayModeBar": False}), md=3),
-            # Gauge — 48h forecast
-            dbc.Col(dcc.Graph(figure=build_gauge(a48, "48h Forecast"), config={"displayModeBar": False}), md=3),
-            # Gauge — 72h forecast
-            dbc.Col(dcc.Graph(figure=build_gauge(a72, "72h Forecast"), config={"displayModeBar": False}), md=3),
+            dbc.Col(dcc.Graph(figure=build_gauge(current, "Current AQI"),  config={"displayModeBar": False}), md=3),
+            dbc.Col(dcc.Graph(figure=build_gauge(a24,     "24h Forecast"), config={"displayModeBar": False}), md=3),
+            dbc.Col(dcc.Graph(figure=build_gauge(a48,     "48h Forecast"), config={"displayModeBar": False}), md=3),
+            dbc.Col(dcc.Graph(figure=build_gauge(a72,     "72h Forecast"), config={"displayModeBar": False}), md=3),
         ], className="mb-3"),
 
-        # Forecast chart
         dbc.Row(dbc.Col(
             dcc.Graph(
                 figure=build_forecast_chart(current, a24, a48, a72, lo24, hi24, history),
@@ -128,7 +200,6 @@ def _render_forecast():
             width=12,
         )),
 
-        # AQI scale legend
         dbc.Row(dbc.Col(html.Div([
             html.Span(f"  {label}: {lo}–{hi}  ",
                       style={"backgroundColor": color, "color": "#000", "padding": "2px 8px",
@@ -137,7 +208,6 @@ def _render_forecast():
             for lo, hi, label, color in AQI_ZONES
         ]), width=12), className="mt-2"),
 
-        # Error notice (if model not yet trained)
         html.Div(f"⚠ {error}", style={"color": "#f38ba8", "marginTop": "12px", "fontSize": "0.85rem"})
         if error else html.Div(),
     ])
@@ -145,7 +215,10 @@ def _render_forecast():
 
 def _render_leaderboard():
     from src.dashboard.inference import load_all_models_metadata
-    metadata = load_all_models_metadata()
+    try:
+        metadata = load_all_models_metadata()
+    except Exception as e:
+        metadata = [{"name": f"Error: {e}", "version": "-"}]
     return dbc.Container(fluid=True, children=[build_leaderboard(metadata)])
 
 
@@ -164,9 +237,12 @@ def _render_ablation():
             ]), md=6),
             dbc.Col(html.Div([
                 html.H6("Backfill Strategy", style={"color": "#cdd6f4"}),
-                html.P("Compares 5 imputation methods for missing sensor data. "
-                       "Gold bar = best strategy (lowest RMSE).",
-                       style={"color": "#a6adc8", "fontSize": "0.82rem"}),
+                html.P(
+                    "Compares 5 imputation methods for missing sensor data. "
+                    "Gold bar = best strategy (lowest RMSE). "
+                    "This panel populates after running the backfill ablation experiment.",
+                    style={"color": "#a6adc8", "fontSize": "0.82rem"},
+                ),
             ]), md=6),
         ]),
     ])
@@ -174,7 +250,10 @@ def _render_ablation():
 
 def _render_shap():
     from src.dashboard.inference import load_shap_data
-    shap_data = load_shap_data()
+    try:
+        shap_data = load_shap_data()
+    except Exception:
+        shap_data = {}
     return dbc.Container(fluid=True, children=[
         html.H4("SHAP Feature Importance", style={"color": "#cdd6f4"}),
         html.P("Why did the model predict what it predicted? SHAP shows the contribution of each feature.",
@@ -185,9 +264,12 @@ def _render_shap():
             dbc.Col(html.Div([
                 html.H6("How to read this", style={"color": "#cdd6f4"}),
                 html.Ul([
-                    html.Li("Longer bar = feature has more influence on predictions", style={"color": "#a6adc8", "fontSize": "0.82rem"}),
-                    html.Li("Red bars = top-importance features", style={"color": "#a6adc8", "fontSize": "0.82rem"}),
-                    html.Li("SHAP values are computed on the best non-LSTM model (tree explainer)", style={"color": "#a6adc8", "fontSize": "0.82rem"}),
+                    html.Li("Longer bar = feature has more influence on predictions",
+                            style={"color": "#a6adc8", "fontSize": "0.82rem"}),
+                    html.Li("Red bars = top-importance features",
+                            style={"color": "#a6adc8", "fontSize": "0.82rem"}),
+                    html.Li("SHAP values computed on the best non-LSTM model (tree explainer)",
+                            style={"color": "#a6adc8", "fontSize": "0.82rem"}),
                 ]),
             ]), md=4),
         ]),

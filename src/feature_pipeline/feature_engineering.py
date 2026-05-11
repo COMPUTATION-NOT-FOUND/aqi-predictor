@@ -250,7 +250,33 @@ def load_scaler() -> Optional[RobustScaler]:
 
 
 def apply_scaler(df: pd.DataFrame, scaler: RobustScaler) -> pd.DataFrame:
+    """Apply a pre-fit scaler to df, tolerating feature set mismatches.
+
+    When the scaler was fit on a different (older) feature set, some columns
+    it expects may be absent from df (e.g. after adding new lag features).
+    Strategy: build a full-width zero array matching the scaler's expected
+    columns, fill in the columns that DO exist, transform the whole array,
+    then write back only the columns present in df.  Missing-column slots
+    remain zero throughout and are discarded — they never affect df values.
+    """
     df = _log_transform(df.copy())
-    cols = [c for c in scaler.feature_names_ if c in df.columns]
-    df[cols] = scaler.transform(df[cols])
+    scaler_cols = scaler.feature_names_           # columns scaler was fit on
+    present     = [c for c in scaler_cols if c in df.columns]
+
+    if not present:
+        return df  # nothing to scale
+
+    # Build a (1 × len(scaler_cols)) zero array; fill present columns
+    arr = np.zeros((len(df), len(scaler_cols)))
+    for i, col in enumerate(scaler_cols):
+        if col in df.columns:
+            arr[:, i] = df[col].values
+
+    scaled = scaler.transform(arr)
+
+    # Write back only the columns that actually exist in df
+    for i, col in enumerate(scaler_cols):
+        if col in df.columns:
+            df[col] = scaled[:, i]
+
     return df

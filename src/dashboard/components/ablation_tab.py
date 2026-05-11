@@ -29,7 +29,7 @@ def build_ablation_charts() -> go.Figure:
     fig = make_subplots(
         rows=1, cols=2,
         subplot_titles=["Feature Group Ablation (RMSE Δ)", "Backfill Strategy Comparison (RMSE)"],
-        horizontal_spacing=0.12,
+        horizontal_spacing=0.14,
     )
 
     # ── Feature ablation ──────────────────────────────────────────────────────
@@ -53,9 +53,19 @@ def build_ablation_charts() -> go.Figure:
         ), row=1, col=1)
         fig.add_hline(y=0, line_color="white", line_dash="dash", row=1, col=1)
     else:
-        fig.add_annotation(text="Run training pipeline to populate ablation data",
-                           xref="x", yref="y", row=1, col=1,
-                           font=dict(color="#a6adc8"), showarrow=False)
+        # Placeholder bar so the subplot is not empty / invisible
+        fig.add_trace(go.Bar(
+            x=["No data yet"], y=[0],
+            marker_color=["#313244"],
+            showlegend=False,
+        ), row=1, col=1)
+        fig.add_annotation(
+            text="Run training pipeline to see ablation data",
+            xref="paper", yref="paper",
+            x=0.22, y=0.5,          # left half of the figure (col 1)
+            font=dict(color="#a6adc8", size=13),
+            showarrow=False,
+        )
 
     # ── Backfill ablation ─────────────────────────────────────────────────────
     back_runs = _load_experiment_runs("backfill_ablation")
@@ -72,9 +82,20 @@ def build_ablation_charts() -> go.Figure:
             hovertemplate="%{x}: RMSE=%{y:.2f}<extra></extra>",
         ), row=1, col=2)
     else:
-        fig.add_annotation(text="Run backfill ablation to populate data",
-                           xref="x2", yref="y2",
-                           font=dict(color="#a6adc8"), showarrow=False)
+        # Placeholder so the right subplot is visible, not collapsed
+        fig.add_trace(go.Bar(
+            x=["No data yet"], y=[0],
+            marker_color=["#313244"],
+            showlegend=False,
+        ), row=1, col=2)
+        fig.add_annotation(
+            text="Backfill ablation not run yet — only feature pipeline<br>data exists. Right panel is intentionally empty.",
+            xref="paper", yref="paper",
+            x=0.78, y=0.5,          # right half of the figure (col 2)
+            font=dict(color="#a6adc8", size=12),
+            align="center",
+            showarrow=False,
+        )
 
     fig.update_layout(
         title="Self-Maintained Ablation Study (auto-updates nightly)",

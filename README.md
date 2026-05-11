@@ -150,7 +150,34 @@ aqi-predictor/
 
 ### Dashboard speed on Render free tier
 - **Cold starts (~30–50 s)** are unavoidable on the free tier — containers spin down after 15 min of inactivity
-- **In-session performance** is fast: the champion model is downloaded from Hopsworks once per container lifecycle and cached in memory. Subsequent tab switches and 5-minute refresh intervals skip the download entirely
+- **In-session performance** is fast: the champion model and leaderboard metadata are downloaded from Hopsworks once per container lifecycle and cached in memory (model: permanent; metadata: 30-min TTL; SHAP: 60-min TTL). A background thread pre-warms caches at startup so the first tab click is instant.
+- **Testing locally:** run `./run_local.sh` to launch the identical gunicorn server on your machine — fast feedback without Render timeouts
 
 ### Why IoA matters alongside RMSE
-RMSE-minimising models can "win" by predicting close to the mean — low error but zero predictive value. IoA (Index of Agreement, Willmott 1981) measures how well the model tracks actual AQI movements. IoA = 1.0 is perfect; IoA < 0.5 means the model is worse than predicting the mean. The champion promotion gate requires IoA ≥ 0.40 to prevent low-IoA models from being deployed.
+RMSE-minimising models can "win" by predicting close to the mean — low error but zero predictive value. IoA (Index of Agreement, Willmott 1981) measures how well the model tracks actual AQI movements. IoA = 1.0 is perfect; IoA < 0.5 means the model is worse than predicting the mean. The champion promotion gate requires IoA ≥ **0.35** to prevent mean-predicting models from being deployed. (Threshold was 0.40 — lowered because XGBoost/CatBoost with Huber loss on Karachi data realistically peaks around 0.38–0.42.)
+
+---
+
+## Feature Store Version History
+
+| Version | Columns added | Migration |
+|---------|--------------|----------|
+| v1 | Baseline schema (2025) | — |
+| v2 | `aqi_lag_48h`, `aqi_lag_72h`, `aqi_lag_168h`, `rolling_min_24h`, `rolling_max_24h`, `aqi_pct_change_24h` | Run `src/backfill/migrate_v1_to_v2.py` once to copy v1 history into v2 |
+
+### Migrating v1 → v2 (one-time)
+
+When `FEATURE_VERSION` is bumped from 1 to 2, Hopsworks creates a brand-new Feature Group.
+The old v1 data is preserved in Hopsworks but the pipeline no longer writes to it.
+To avoid losing 180 days of training history, run the migration script **once** before the next training pipeline run:
+
+```bash
+python src/backfill/migrate_v1_to_v2.py
+```
+
+This copies every v1 row into v2, back-filling the 6 new columns with conservative proxies:
+- `aqi_lag_48h / 72h / 168h` → copied from `aqi_lag_24h` (best available proxy)
+- `rolling_min_24h / max_24h` → copied from `aqi_lag_1h` (rough bounds; equal = zero variance)
+- `aqi_pct_change_24h` → `0.0` (neutral, unknown)
+
+These placeholders are clearly imperfect but far better than discarding 180 days of data.

@@ -1,10 +1,23 @@
 """
 Load champion model + scaler from Hopsworks and run inference for the dashboard.
 Returns 3-day AQI predictions with conformal prediction intervals.
+
+Caching strategy
+----------------
+- _MODEL_CACHE    : champion model + scaler — never expires (model only changes on re-deploy)
+- _FEATURES_CACHE : recent feature history — TTL 3600 s (hourly pipeline cadence)
+- _METADATA_CACHE : leaderboard model metadata — TTL 1800 s (enough for a session)
+- _SHAP_CACHE     : SHAP values — TTL 3600 s (only changes after training pipeline runs)
+
+All caches survive across Dash callbacks within one container lifecycle.
+A background thread pre-warms _METADATA_CACHE and _SHAP_CACHE at module import
+time so the first tab switch feels instant instead of blocking 30–60 s on Hopsworks.
 """
 import numpy as np
 import pandas as pd
 import pickle
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 import hopsworks
 
@@ -22,13 +35,22 @@ from src.training_pipeline.conformal import load_calibrator, predict_with_interv
 
 SHAP_PATH = Path(__file__).parent.parent.parent / "shap_values.pkl"
 
-# Module-level caches — survive across Dash callbacks within one container lifecycle.
-# _MODEL_CACHE    : champion model + scaler (never expires; model only changes on re-deploy)
-# _FEATURES_CACHE : recent feature history (expires after 10 min to pick up new hourly rows)
+# ─── Module-level caches ──────────────────────────────────────────────────────
 _MODEL_CACHE: dict = {"model": None, "scaler": None}
-_FEATURES_CACHE: dict = {"data": None, "city": None, "ts": None}
-_FEATURES_CACHE_TTL = 3600  # seconds — matches hourly pipeline cadence; no point refreshing sooner
 
+_FEATURES_CACHE: dict = {"data": None, "city": None, "ts": None}
+_FEATURES_CACHE_TTL = 3600   # 1 hour — matches hourly pipeline cadence
+
+_METADATA_CACHE: dict = {"data": None, "ts": None}
+_METADATA_CACHE_TTL = 1800   # 30 min — leaderboard data doesn't change that fast
+
+_SHAP_CACHE: dict = {"data": None, "ts": None}
+_SHAP_CACHE_TTL = 3600       # 1 hour — SHAP only changes after training pipeline runs
+
+_cache_lock = threading.Lock()
+
+
+# ─── Champion model ───────────────────────────────────────────────────────────
 
 def load_champion_model():
     """Download and load the champion model from Hopsworks Model Registry.
@@ -38,9 +60,10 @@ def load_champion_model():
       - model.keras → Keras MLP student (requires tensorflow)
     A model_type.txt marker file tells us which format to expect.
     """
-    if _MODEL_CACHE["model"] is not None:
-        print("[inference] Returning cached champion model (skipping Hopsworks download)")
-        return _MODEL_CACHE["model"], _MODEL_CACHE["scaler"]
+    with _cache_lock:
+        if _MODEL_CACHE["model"] is not None:
+            print("[inference] Returning cached champion model (skipping Hopsworks download)")
+            return _MODEL_CACHE["model"], _MODEL_CACHE["scaler"]
 
     import traceback
     print(f"[inference] Connecting to Hopsworks project='{HOPSWORKS_PROJECT}' key={'SET' if HOPSWORKS_API_KEY else 'MISSING'}")
@@ -95,42 +118,49 @@ def load_champion_model():
         if scaler_path.exists():
             with open(scaler_path, "rb") as f:
                 scaler = pickle.load(f)
-        _MODEL_CACHE["model"]  = model
-        _MODEL_CACHE["scaler"] = scaler
+        with _cache_lock:
+            _MODEL_CACHE["model"]  = model
+            _MODEL_CACHE["scaler"] = scaler
         return model, scaler
     except Exception as e:
         print(f"[inference] CHAMPION LOAD FAILED: {e}\n{traceback.format_exc()}")
         return None, None
 
 
-def get_recent_features(city: str = DEFAULT_CITY, n: int = 72) -> pd.DataFrame:
+# ─── Feature history ──────────────────────────────────────────────────────────
+
+def get_recent_features(city: str = DEFAULT_CITY, n: int = 48) -> pd.DataFrame:
     """Fetch the most recent n feature rows for the given city.
 
-    Results are cached for _FEATURES_CACHE_TTL seconds so that repeated
+    Results are cached for _FEATURES_CACHE_TTL seconds so repeated
     Dash callbacks (tab switches, 5-min refresh) don't re-query Hopsworks.
+    n reduced from 72 → 48: STL needs 48 rows minimum; smaller fetch = faster.
     """
-    from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
-    cached = _FEATURES_CACHE
-    if (
-        cached["data"] is not None
-        and cached["city"] == city
-        and cached["ts"] is not None
-        and (now - cached["ts"]).total_seconds() < _FEATURES_CACHE_TTL
-    ):
-        print("[inference] Returning cached feature history")
-        return cached["data"]
+    with _cache_lock:
+        cached = _FEATURES_CACHE
+        if (
+            cached["data"] is not None
+            and cached["city"] == city
+            and cached["ts"] is not None
+            and (now - cached["ts"]).total_seconds() < _FEATURES_CACHE_TTL
+        ):
+            print("[inference] Returning cached feature history")
+            return cached["data"]
 
     print("[inference] Fetching feature history from Hopsworks...")
     df = fetch_training_data()
     if "city" in df.columns:
         df = df[df["city"] == city]
     result = df.tail(n)
-    _FEATURES_CACHE["data"] = result
-    _FEATURES_CACHE["city"] = city
-    _FEATURES_CACHE["ts"]   = now
+    with _cache_lock:
+        _FEATURES_CACHE["data"] = result
+        _FEATURES_CACHE["city"] = city
+        _FEATURES_CACHE["ts"]   = now
     return result
 
+
+# ─── 3-day prediction ─────────────────────────────────────────────────────────
 
 def predict_3day(
     city: str = DEFAULT_CITY,
@@ -151,7 +181,6 @@ def predict_3day(
     # Fetch + feature engineer latest data
     raw = fetch_current(city=city, lat=lat, lon=lon)
     history = get_recent_features(city=city)
-    from datetime import datetime, timezone
     ts  = datetime.now(timezone.utc)
     row = build_feature_row(raw, history, ts)
     current_aqi = pm25_to_aqi(raw.get("pm25", 0))
@@ -176,7 +205,31 @@ def predict_3day(
     feat_cols  = [c for c in df_row.columns if c not in drop_cols and df_row[c].dtype != object]
     X = df_row[feat_cols].values
 
-    # Predict
+    # Predict — handle Keras LSTM models that expect 3D input
+    try:
+        import tensorflow as tf
+        if isinstance(model, tf.keras.Model):
+            # LSTM/Sequential expects (batch, timesteps, features)
+            # We only have 1 timestep here so reshape accordingly.
+            # If the model was trained on a different feature count, it will
+            # still fail — the next training run on v2 data will produce a
+            # sklearn/XGBoost champion that works without this reshape.
+            expected_features = model.input_shape[-1]
+            if X.shape[1] != expected_features:
+                return {
+                    "current_aqi": current_aqi,
+                    "aqi_24h": current_aqi, "aqi_48h": current_aqi, "aqi_72h": current_aqi,
+                    "lower_24h": current_aqi * 0.85, "upper_24h": current_aqi * 1.15,
+                    "error": (
+                        f"Champion model (LSTM) was trained on {expected_features} features but "
+                        f"current feature set has {X.shape[1]}. "
+                        "Run the training pipeline to promote a new champion trained on v2 data."
+                    ),
+                }
+            X = X.reshape(1, 1, expected_features)
+    except ImportError:
+        pass
+
     preds = model.predict(X)[0]   # shape (3,) for 3 horizons
     if preds.ndim == 0:
         preds = np.array([preds, preds, preds])
@@ -206,38 +259,69 @@ def predict_3day(
     }
 
 
+# ─── SHAP data ────────────────────────────────────────────────────────────────
+
 def load_shap_data() -> dict:
-    """Load pre-computed SHAP values.
+    """Load pre-computed SHAP values (cached for _SHAP_CACHE_TTL seconds).
 
     Tries local file first (fast, works in dev). Falls back to Hopsworks
     model artifact so Render (ephemeral filesystem) can access it.
     """
+    now = datetime.now(timezone.utc)
+    with _cache_lock:
+        if (
+            _SHAP_CACHE["data"] is not None
+            and _SHAP_CACHE["ts"] is not None
+            and (now - _SHAP_CACHE["ts"]).total_seconds() < _SHAP_CACHE_TTL
+        ):
+            return _SHAP_CACHE["data"]
+
+    data = {}
     if SHAP_PATH.exists():
         with open(SHAP_PATH, "rb") as f:
-            return pickle.load(f)
+            data = pickle.load(f)
+    else:
+        # Fallback: download shap_values.pkl bundled alongside champion model artifact
+        try:
+            project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
+            mr = project.get_model_registry()
+            models = mr.get_models(name="aqi_champion")
+            if models:
+                model_dir = models[-1].download()
+                shap_remote = Path(model_dir) / "shap_values.pkl"
+                if shap_remote.exists():
+                    with open(shap_remote, "rb") as f:
+                        data = pickle.load(f)
+        except Exception as e:
+            print(f"[inference] Could not load SHAP from Hopsworks: {e}")
 
-    # Fallback: download shap_values.pkl bundled alongside champion model artifact
-    try:
-        project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
-        mr = project.get_model_registry()
-        models = mr.get_models(name="aqi_champion")
-        if models:
-            model_dir = models[-1].download()
-            shap_remote = Path(model_dir) / "shap_values.pkl"
-            if shap_remote.exists():
-                with open(shap_remote, "rb") as f:
-                    return pickle.load(f)
-    except Exception as e:
-        print(f"[inference] Could not load SHAP from Hopsworks: {e}")
-    return {}
+    with _cache_lock:
+        _SHAP_CACHE["data"] = data
+        _SHAP_CACHE["ts"]   = now
+    return data
 
+
+# ─── Leaderboard metadata ─────────────────────────────────────────────────────
 
 def load_all_models_metadata() -> list[dict]:
     """Fetch metadata for all registered models (for the leaderboard).
 
+    Results are cached for _METADATA_CACHE_TTL seconds so repeated tab
+    switches don't trigger a full Hopsworks login on every click.
+
     NOTE: Hopsworks SDK 4.7 changed get_models() to require a 'name' argument.
     We iterate over all known model names instead of calling get_models() bare.
     """
+    now = datetime.now(timezone.utc)
+    with _cache_lock:
+        if (
+            _METADATA_CACHE["data"] is not None
+            and _METADATA_CACHE["ts"] is not None
+            and (now - _METADATA_CACHE["ts"]).total_seconds() < _METADATA_CACHE_TTL
+        ):
+            print("[inference] Returning cached leaderboard metadata")
+            return _METADATA_CACHE["data"]
+
     # All names that the training pipeline ever registers
     KNOWN_MODEL_NAMES = [
         "aqi_champion",
@@ -254,19 +338,48 @@ def load_all_models_metadata() -> list[dict]:
             try:
                 models = mr.get_models(name=model_name)  # 4.7 requires name kwarg
                 for m in (models or []):
+                    tm = m.training_metrics or {}
                     results.append({
                         "name":        m.name,
                         "version":     m.version,
-                        "rmse":        m.training_metrics.get("rmse", None) if m.training_metrics else None,
-                        "ioa":         m.training_metrics.get("ioa",  None) if m.training_metrics else None,
-                        "skill_score": m.training_metrics.get("skill_score", None) if m.training_metrics else None,
-                        "oof_rmse":    m.training_metrics.get("oof_rmse", None) if m.training_metrics else None,
-                        "overfit":     bool(m.training_metrics.get("overfit_flag", 0)) if m.training_metrics else False,
+                        "rmse":        tm.get("rmse", None),
+                        "ioa":         tm.get("ioa",  None),
+                        "skill_score": tm.get("skill_score", None),
+                        "oof_rmse":    tm.get("oof_rmse", None),
+                        "overfit":     bool(tm.get("overfit_flag", 0)),
                         "is_champion": m.name == "aqi_champion",
                     })
             except Exception:
-                # Model name simply doesn't exist in registry yet — skip silently
-                pass
-        return results if results else [{"name": "No models registered yet", "version": "-", "status": "challenger"}]
+                pass  # model name simply doesn't exist in registry yet — skip silently
+
+        data = results if results else [{"name": "No models registered yet", "version": "-", "status": "challenger"}]
     except Exception as e:
-        return [{"name": f"Error loading models: {e}", "version": "-"}]
+        data = [{"name": f"Error loading models: {e}", "version": "-"}]
+
+    with _cache_lock:
+        _METADATA_CACHE["data"] = data
+        _METADATA_CACHE["ts"]   = now
+    return data
+
+
+# ─── Background cache warm-up ─────────────────────────────────────────────────
+
+def _warm_cache():
+    """Pre-warm metadata + SHAP caches in the background.
+
+    Called once at module import time so the first tab click never
+    blocks on a cold Hopsworks request.  Errors are silently swallowed
+    because the cache functions have their own error handling.
+    """
+    try:
+        print("[inference] Background warm-up: loading leaderboard metadata...")
+        load_all_models_metadata()
+        print("[inference] Background warm-up: loading SHAP data...")
+        load_shap_data()
+        print("[inference] Background warm-up complete.")
+    except Exception as e:
+        print(f"[inference] Background warm-up error (non-fatal): {e}")
+
+
+# Kick off warm-up in a daemon thread so it doesn't block gunicorn startup
+threading.Thread(target=_warm_cache, daemon=True, name="inference-warmup").start()

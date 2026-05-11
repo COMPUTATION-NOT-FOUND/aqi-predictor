@@ -9,11 +9,41 @@ from src.config import PSI_WARN_THRESHOLD, PSI_ALERT_THRESHOLD
 
 def build_drift_heatmap() -> go.Figure:
     entries = load_drift_log(last_n=720)
+
+    _no_data_layout = dict(
+        paper_bgcolor="#1e1e2e",
+        plot_bgcolor="#1e1e2e",
+        font=dict(color="#cdd6f4"),
+        margin=dict(l=20, r=20, t=60, b=40),
+    )
+
     if not entries:
-        return go.Figure().update_layout(
-            title="No drift data yet (run feature pipeline first)",
-            paper_bgcolor="#1e1e2e", font=dict(color="#cdd6f4"),
+        # Return a clear, styled "no drift yet" message instead of a blank axes
+        fig = go.Figure()
+        fig.add_annotation(
+            text=(
+                "✅  No drift detected yet<br><br>"
+                "<span style='font-size:13px;color:#a6adc8'>"
+                "The drift monitor compares each hourly batch to the training baseline.<br>"
+                "PSI scores will appear here once the feature pipeline has run several times.<br><br>"
+                "PSI &lt; 0.1 → no drift &nbsp;|&nbsp; "
+                "0.1–0.2 → moderate &nbsp;|&nbsp; "
+                "&gt; 0.2 → alert (email sent)"
+                "</span>"
+            ),
+            xref="paper", yref="paper",
+            x=0.5, y=0.55,
+            font=dict(size=18, color="#a6e3a1"),
+            align="center",
+            showarrow=False,
         )
+        fig.update_layout(
+            title="Data Drift Monitor",
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            **_no_data_layout,
+        )
+        return fig
 
     records = []
     for e in entries:
@@ -28,8 +58,29 @@ def build_drift_heatmap() -> go.Figure:
     feature_volatility = pivot.std(axis=1).nlargest(20).index
     pivot = pivot.loc[feature_volatility]
 
-    # Color: green < 0.1, yellow 0.1–0.2, red > 0.2
     z = pivot.fillna(0).values
+
+    # If everything is effectively zero → show "no drift" message
+    if z.max() < 0.01:
+        fig = go.Figure()
+        fig.add_annotation(
+            text=(
+                "✅  No significant drift detected<br><br>"
+                "<span style='font-size:13px;color:#a6adc8'>"
+                f"All feature PSI scores &lt; 0.01 — data distribution matches training baseline."
+                "</span>"
+            ),
+            xref="paper", yref="paper",
+            x=0.5, y=0.55,
+            font=dict(size=18, color="#a6e3a1"),
+            align="center",
+            showarrow=False,
+        )
+        fig.update_layout(title="Data Drift Monitor — No Drift Detected",
+                          xaxis=dict(visible=False), yaxis=dict(visible=False),
+                          **_no_data_layout)
+        return fig
+
     colorscale = [
         [0.0,  "#a6e3a1"],
         [PSI_WARN_THRESHOLD / 0.5, "#f9e2af"],

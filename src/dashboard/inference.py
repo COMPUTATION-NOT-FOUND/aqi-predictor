@@ -282,7 +282,7 @@ def predict_3day(
         except Exception:
             pass
 
-    return {
+    result = {
         "current_aqi": current_aqi,
         "aqi_24h":     aqi_24h,
         "aqi_48h":     aqi_48h,
@@ -292,8 +292,125 @@ def predict_3day(
         "feature_row": row,
     }
 
+    # Log prediction asynchronously (non-blocking — never fails the dashboard)
+    model_ver = getattr(getattr(_MODEL_CACHE.get("model"), "_hops_version", None), "__str__", lambda: "unknown")()
+    threading.Thread(
+        target=_log_prediction_async,
+        args=(city, current_aqi, aqi_24h, aqi_48h, aqi_72h, model_ver),
+        daemon=True,
+        name="prediction-logger",
+    ).start()
+
+    return result
+
+# ─── Live prediction logging ──────────────────────────────────────────────────
+# Rolling 30-day window: old rows are deleted to stay within Hopsworks free tier.
+# Logging runs in a background daemon thread so it never blocks the dashboard.
+
+_PREDICTION_LOG_TTL_DAYS = 30   # keep 30 days of hourly predictions ≈ 720 rows max
+
+
+def _log_prediction_async(
+    city: str,
+    current_aqi: float,
+    aqi_24h: float,
+    aqi_48h: float,
+    aqi_72h: float,
+    model_version: str = "unknown",
+) -> None:
+    """
+    Write one prediction row to the Hopsworks 'aqi_predictions' Feature Group.
+
+    Enforces a rolling 30-day window — any rows older than _PREDICTION_LOG_TTL_DAYS
+    are deleted before inserting to keep row counts within free-tier limits.
+
+    Called from a daemon thread; all errors are swallowed so the dashboard
+    is never affected by a logging failure.
+    """
+    try:
+        import hopsworks as hw
+        project = hw.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
+        fs = project.get_feature_store()
+
+        now_utc = datetime.now(timezone.utc)
+        cutoff  = now_utc.timestamp() - (_PREDICTION_LOG_TTL_DAYS * 86400)
+
+        row = {
+            "city":          city,
+            "ts_epoch":      int(now_utc.timestamp()),   # primary key (int epoch)
+            "predicted_24h": round(float(aqi_24h),  2),
+            "predicted_48h": round(float(aqi_48h),  2),
+            "predicted_72h": round(float(aqi_72h),  2),
+            "observed_aqi":  round(float(current_aqi), 2),
+            "model_version": str(model_version),
+        }
+
+        try:
+            fg = fs.get_feature_group(name="aqi_predictions", version=1)
+        except Exception:
+            # Feature group doesn't exist yet — create it on first call
+            fg = fs.create_feature_group(
+                name="aqi_predictions",
+                version=1,
+                primary_key=["city", "ts_epoch"],
+                description=(
+                    "Live AQI predictions logged by the dashboard. "
+                    f"Rolling {_PREDICTION_LOG_TTL_DAYS}-day window (free-tier friendly)."
+                ),
+                online_enabled=False,
+            )
+
+        import pandas as _pd
+        df_row = _pd.DataFrame([row])
+        fg.insert(df_row, write_options={"wait_for_job": False})
+
+        # ── Rolling window cleanup: delete rows older than cutoff ──────────────
+        # Hopsworks free tier has no automatic TTL; we purge via a time-filtered
+        # read + delete pattern using the offline store.
+        try:
+            existing = fg.select_all().as_of(online=False).read(read_options={"use_hive": False})
+            old_rows = existing[existing["ts_epoch"] < cutoff]
+            if not old_rows.empty:
+                fg.delete(old_rows["ts_epoch"].tolist())
+                print(f"[inference] Pruned {len(old_rows)} old prediction rows "
+                      f"(> {_PREDICTION_LOG_TTL_DAYS} days)")
+        except Exception as prune_err:
+            # Pruning failure is non-critical — log and continue
+            print(f"[inference] Rolling-window prune skipped: {prune_err}")
+
+        print(f"[inference] Logged prediction: city={city} AQI={current_aqi:.0f} "
+              f"→ 24h={aqi_24h:.0f} 48h={aqi_48h:.0f} 72h={aqi_72h:.0f}")
+
+    except Exception as e:
+        print(f"[inference] Prediction logging failed (non-fatal): {e}")
+
+
+def load_prediction_log(city: str = DEFAULT_CITY, days: int = 7) -> "pd.DataFrame":
+    """
+    Fetch recent prediction log rows for the hindcast chart.
+
+    Returns a DataFrame with columns: ts_epoch, observed_aqi, predicted_24h,
+    predicted_48h, predicted_72h, model_version.
+    Returns empty DataFrame on any error.
+    """
+    try:
+        import hopsworks as hw
+        project = hw.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
+        fs = project.get_feature_store()
+        fg = fs.get_feature_group(name="aqi_predictions", version=1)
+        cutoff = int((datetime.now(timezone.utc).timestamp()) - days * 86400)
+        df = fg.select_all().as_of(online=False).read(read_options={"use_hive": False})
+        df = df[df["city"] == city]
+        df = df[df["ts_epoch"] >= cutoff]
+        df["timestamp"] = pd.to_datetime(df["ts_epoch"], unit="s", utc=True)
+        return df.sort_values("ts_epoch").reset_index(drop=True)
+    except Exception as e:
+        print(f"[inference] load_prediction_log failed (non-fatal): {e}")
+        return pd.DataFrame()
+
 
 # ─── SHAP data ────────────────────────────────────────────────────────────────
+
 
 def load_shap_data() -> dict:
     """Load pre-computed SHAP values (cached for _SHAP_CACHE_TTL seconds).

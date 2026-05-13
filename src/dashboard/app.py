@@ -15,7 +15,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from src.config import DEFAULT_CITY, AQI_ZONES, aqi_color, aqi_label
 from src.dashboard.components.alerts import build_alert_banner
 from src.dashboard.components.gauge import build_gauge
-from src.dashboard.components.forecast_chart import build_forecast_chart
+from src.dashboard.components.forecast_chart import (
+    build_ground_truth_chart,
+    build_hindcast_chart,
+    build_live_forecast_chart,
+    build_forecast_chart,   # backwards-compat shim
+)
 from src.dashboard.components.leaderboard import build_leaderboard
 from src.dashboard.components.shap_plot import build_shap_bar
 from src.dashboard.components.drift_tab import build_drift_heatmap
@@ -181,34 +186,106 @@ def _render_forecast():
     except Exception:
         history = None
 
+    # ── "How to read" explanation card ────────────────────────────────────────
+    how_to_read = html.Details([
+        html.Summary("ℹ️  How to read these charts", style={
+            "color": "#89b4fa", "fontWeight": "600",
+            "fontSize": "0.88rem", "cursor": "pointer",
+        }),
+        html.Div([
+            html.Ul([
+                html.Li([
+                    html.B("Panel A — Observed AQI: "),
+                    "Raw PM2.5-derived AQI readings from AQICN + OpenMeteo sensors. "
+                    "This is what actually happened — the ground truth.",
+                ], style={"marginBottom": "6px"}),
+                html.Li([
+                    html.B("Panel B — Model Verification: "),
+                    "OOF (out-of-fold) predictions overlaid on observed data. "
+                    "The model never saw these samples during training — "
+                    "this is a leakage-free check of how well it tracks reality. "
+                    "Metric badges: RMSE (error magnitude), IoA (Willmott 1981 agreement, 0–1), "
+                    "Skill (1 − RMSE_model/RMSE_persistence; > 0 = beats naive baseline).",
+                ], style={"marginBottom": "6px"}),
+                html.Li([
+                    html.B("Panel C — Live Forecast: "),
+                    "Forward-looking 72-hour prediction starting from Now. "
+                    "Shaded band = 90% conformal prediction interval "
+                    "(MAPIE-calibrated on held-out data, not a Gaussian approximation).",
+                ]),
+            ], style={"color": "#a6adc8", "fontSize": "0.83rem",
+                      "lineHeight": "1.6", "paddingLeft": "18px"}),
+        ], style={"padding": "10px 14px",
+                  "backgroundColor": "#181825",
+                  "borderRadius": "6px",
+                  "marginTop": "8px"}),
+    ], open=False, style={
+        "backgroundColor": "#1e1e2e",
+        "border": "1px solid #313244",
+        "borderRadius": "8px",
+        "padding": "10px 14px",
+        "marginBottom": "16px",
+    })
+
+    # ── AQI zone legend ───────────────────────────────────────────────────────
+    zone_legend = dbc.Row(dbc.Col(html.Div([
+        html.Span(f"  {label}: {lo}–{hi}  ",
+                  style={"backgroundColor": color, "color": "#000", "padding": "2px 8px",
+                         "borderRadius": "4px", "marginRight": "6px", "fontSize": "0.75rem",
+                         "fontWeight": "bold"})
+        for lo, hi, label, color in AQI_ZONES
+    ]), width=12), className="mb-3")
+
     return dbc.Container(fluid=True, children=[
         build_alert_banner(max(current, a24, a48, a72)),
 
+        # Gauges
         dbc.Row([
-            dbc.Col(dcc.Graph(figure=build_gauge(current, "Current AQI"),  config={"displayModeBar": False}), md=3),
-            dbc.Col(dcc.Graph(figure=build_gauge(a24,     "24h Forecast"), config={"displayModeBar": False}), md=3),
-            dbc.Col(dcc.Graph(figure=build_gauge(a48,     "48h Forecast"), config={"displayModeBar": False}), md=3),
-            dbc.Col(dcc.Graph(figure=build_gauge(a72,     "72h Forecast"), config={"displayModeBar": False}), md=3),
+            dbc.Col(dcc.Graph(figure=build_gauge(current, "Current AQI"),
+                              config={"displayModeBar": False}), md=3),
+            dbc.Col(dcc.Graph(figure=build_gauge(a24, "24h Forecast"),
+                              config={"displayModeBar": False}), md=3),
+            dbc.Col(dcc.Graph(figure=build_gauge(a48, "48h Forecast"),
+                              config={"displayModeBar": False}), md=3),
+            dbc.Col(dcc.Graph(figure=build_gauge(a72, "72h Forecast"),
+                              config={"displayModeBar": False}), md=3),
         ], className="mb-3"),
 
+        how_to_read,
+        zone_legend,
+
+        # Panel A — Observed ground truth
         dbc.Row(dbc.Col(
             dcc.Graph(
-                figure=build_forecast_chart(current, a24, a48, a72, lo24, hi24, history),
+                id="chart-ground-truth",
+                figure=build_ground_truth_chart(history),
                 config={"displayModeBar": True},
-                style={"height": "380px"},
-            ),
-            width=12,
-        )),
+                style={"height": "300px"},
+            ), width=12,
+        ), className="mb-3"),
 
-        dbc.Row(dbc.Col(html.Div([
-            html.Span(f"  {label}: {lo}–{hi}  ",
-                      style={"backgroundColor": color, "color": "#000", "padding": "2px 8px",
-                             "borderRadius": "4px", "marginRight": "6px", "fontSize": "0.75rem",
-                             "fontWeight": "bold"})
-            for lo, hi, label, color in AQI_ZONES
-        ]), width=12), className="mt-2"),
+        # Panel B — Model hindcast (OOF predictions vs observed)
+        dbc.Row(dbc.Col(
+            dcc.Graph(
+                id="chart-hindcast",
+                figure=build_hindcast_chart(history, None),  # OOF df populated from MLflow if available
+                config={"displayModeBar": True},
+                style={"height": "300px"},
+            ), width=12,
+        ), className="mb-3"),
 
-        html.Div(f"⚠ {error}", style={"color": "#f38ba8", "marginTop": "12px", "fontSize": "0.85rem"})
+        # Panel C — Live 72-hour forecast
+        dbc.Row(dbc.Col(
+            dcc.Graph(
+                id="chart-live-forecast",
+                figure=build_live_forecast_chart(current, a24, a48, a72, lo24, hi24, history),
+                config={"displayModeBar": True},
+                style={"height": "320px"},
+            ), width=12,
+        ), className="mb-3"),
+
+        html.Div(f"⚠ {error}",
+                 style={"color": "#f38ba8", "marginTop": "8px", "fontSize": "0.85rem"})
         if error else html.Div(),
     ])
 

@@ -38,7 +38,10 @@ def run_pipeline(city: str = DEFAULT_CITY, lat: float = DEFAULT_LAT, lon: float 
     # 3. Build feature row
     ts  = datetime.now(timezone.utc)
     row = build_feature_row(raw, history, ts)
-    row["aqi"] = pm25_to_aqi(raw.get("pm25", 0))
+    # Use AQICN's correctly computed AQI directly — do NOT re-convert PM2.5
+    # (pm25 from OpenWeather and AQICN sub-index are not the same unit)
+    row["aqi"] = int(raw["aqi_from_api"]) if raw.get("aqi_from_api", 0) > 0 else pm25_to_aqi(raw.get("pm25", 0))
+
 
     df = pd.DataFrame([row])
 

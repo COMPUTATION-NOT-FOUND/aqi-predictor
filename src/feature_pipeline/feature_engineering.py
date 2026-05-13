@@ -154,8 +154,15 @@ def build_feature_row(raw: dict, history: pd.DataFrame, ts: datetime) -> dict:
     """
     row = {"timestamp": ts.isoformat(), "city": raw.get("city", "karachi")}
 
-    aqi_current = pm25_to_aqi(raw.get("pm25", 0))
+    # Use the pre-computed AQI from AQICN API when available (no double conversion).
+    # Fall back to pm25_to_aqi() only for historical backfill rows that were built
+    # before fetch_current() started providing aqi_from_api.
+    if "aqi_from_api" in raw and raw["aqi_from_api"] > 0:
+        aqi_current = int(raw["aqi_from_api"])
+    else:
+        aqi_current = pm25_to_aqi(raw.get("pm25", 0))
     row["aqi"] = aqi_current  # always include current AQI
+
 
     if FEATURE_GROUPS["raw_pollutants"]:
         for col in ["pm25", "pm10", "o3", "no2", "so2", "co"]:

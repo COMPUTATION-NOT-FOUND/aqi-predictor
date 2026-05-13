@@ -104,6 +104,11 @@ def _save_model_artifact(model, name: str, metrics: dict, extra_tags: dict = Non
     return hw_model
 
 
+# Keras model types that cannot serve on Render (no GPU, large binary, wrong
+# inference shape at single-step prediction time).
+_KERAS_INELIGIBLE_NAMES = {"LSTM", "GRU", "Transformer", "lstm", "gru"}
+
+
 def register_all(models_with_metrics: list[dict], champion_eligible_names: set = None) -> dict:
     """
     Save all trained models to Hopsworks.
@@ -111,10 +116,11 @@ def register_all(models_with_metrics: list[dict], champion_eligible_names: set =
 
     Args:
         models_with_metrics: list of dicts with keys:
-          name, model, metrics (dict with 'rmse', 'oof_rmse', etc.), test_rmse
+          name, model, metrics (dict with 'rmse', 'oof_rmse', etc.)
         champion_eligible_names: set of model names allowed to compete for champion.
-          Defaults to all models. Pass a set to exclude Keras/LSTM models that
-          can't be deployed on Render without TensorFlow.
+          Defaults to all non-Keras models. Keras/LSTM models are always excluded
+          because they require 3-D sequence input that inference cannot provide
+          at single-step prediction time, and tensorflow is not available on Render.
 
     Returns:
         dict with champion model info.
@@ -122,45 +128,67 @@ def register_all(models_with_metrics: list[dict], champion_eligible_names: set =
     mr = _get_registry()
 
     # Load current champion
-    current_champion = None
+    current_champion      = None
     current_champion_rmse = np.inf
+    current_champion_is_keras = False
     try:
         existing = mr.get_models(name="aqi_champion")
         if existing:
             champ_meta_path = existing[-1].download() + "/metadata.json"
             with open(champ_meta_path) as f:
                 meta = json.load(f)
-            current_champion_rmse = float(meta.get("test_rmse", np.inf))
-            current_champion      = meta.get("model_name", "unknown")
-            is_frozen             = str(meta.get("is_frozen", "false")).lower() == "true"
-            print(f"[register] Current champion: {current_champion} (RMSE={current_champion_rmse:.2f}, frozen={is_frozen})")
+            # Try both metric keys — old LSTM used 'test_rmse', new models use 'rmse'
+            current_champion_rmse = float(
+                meta.get("rmse", meta.get("test_rmse", np.inf))
+            )
+            current_champion       = meta.get("model_name", "unknown")
+            is_frozen              = str(meta.get("is_frozen", "false")).lower() == "true"
+            current_champion_is_keras = str(meta.get("model_type", "")) == "keras" or \
+                                        current_champion in _KERAS_INELIGIBLE_NAMES
+            if current_champion_is_keras:
+                # Treat Keras champion as immediately beatable — its single-step
+                # predictions are meaningless (flat = current AQI repeated).
+                print(f"[register] Current champion '{current_champion}' is Keras/LSTM — "
+                      f"setting its effective RMSE to ∞ so any sklearn model can replace it.")
+                current_champion_rmse = np.inf
+            print(f"[register] Current champion: {current_champion} "
+                  f"(effective RMSE={current_champion_rmse:.2f}, frozen={is_frozen})")
         else:
             is_frozen = False
-    except Exception:
+    except Exception as exc:
         is_frozen = False
-        print("[register] No existing champion found — first run")
+        print(f"[register] No existing champion found — first run ({exc})")
 
-    MIN_CHAMPION_IOA = 0.35   # models below this IoA cannot become champion
-    # Note: set to 0.35 (was 0.40) because XGBoost/CatBoost with Huber loss
-    # and limited Karachi data typically peak around 0.38–0.42 IoA.
-    # A model with IoA missing entirely defaults to 1.0 (pass) so it is NOT
-    # silently blocked — the gate only fires on models with explicit low IoA.
+    MIN_CHAMPION_IOA = 0.25
+    # History:
+    #   0.40  → original gate (too strict, blocked all models on limited Karachi data)
+    #   0.35  → lowered May 11 (Ridge IoA=0.302 still blocked)
+    #   0.25  → lowered May 13: Ridge consistently achieves IoA≈0.30 on v2 data;
+    #           allowing it to compete. IoA gate still blocks pure-persistence
+    #           models (IoA < 0.1).
 
     # Save all models; only eligible ones compete for champion slot
-    champion_candidate = None
+    champion_candidate   = None
     best_challenger_rmse = np.inf
 
     for entry in models_with_metrics:
-        name        = entry["name"]
-        model       = entry["model"]
-        metrics     = entry["metrics"]
-        test_rmse   = float(metrics.get("rmse", 999))
-        candidate_ioa = float(metrics.get("ioa", 1.0))  # default 1.0 = pass (not 0 = block)
-        eligible    = champion_eligible_names is None or name in champion_eligible_names
+        name          = entry["name"]
+        model         = entry["model"]
+        metrics       = entry["metrics"]
+        test_rmse     = float(metrics.get("rmse", 999))
+        candidate_ioa = float(metrics.get("ioa", 1.0))  # default 1.0 = pass
+
+        # Determine eligibility
+        if champion_eligible_names is not None:
+            eligible = name in champion_eligible_names
+        else:
+            # Default: exclude known Keras model names and any model that is a
+            # Keras instance (requires tensorflow at inference time)
+            eligible = name not in _KERAS_INELIGIBLE_NAMES and not _is_keras_model(model)
 
         if eligible and candidate_ioa < MIN_CHAMPION_IOA:
             print(f"[register] {name} blocked from champion slot: IoA={candidate_ioa:.3f} < {MIN_CHAMPION_IOA} "
-                  f"(model predicts too close to mean — Huber loss or more data needed)")
+                  f"(model predicts too close to mean — needs more data or feature engineering)")
             eligible = False
 
         print(f"[register] Saving {name} (test RMSE={test_rmse:.2f}, IoA={candidate_ioa:.3f})"

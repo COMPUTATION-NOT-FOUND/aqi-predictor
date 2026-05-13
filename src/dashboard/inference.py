@@ -177,70 +177,104 @@ def predict_3day(
 
     Returns dict with keys: current_aqi, aqi_24h, aqi_48h, aqi_72h,
                              lower_24h, upper_24h, feature_row
+    Always returns a valid dict — never raises an exception.
     """
-    # Fetch + feature engineer latest data
-    raw = fetch_current(city=city, lat=lat, lon=lon)
-    history = get_recent_features(city=city)
-    ts  = datetime.now(timezone.utc)
-    row = build_feature_row(raw, history, ts)
-    current_aqi = pm25_to_aqi(raw.get("pm25", 0))
+    # Step 1: fetch raw data — isolated so a network blip gives us current_aqi
+    # from cache before we bail out
+    current_aqi = 0
+    raw = {}
+    try:
+        raw = fetch_current(city=city, lat=lat, lon=lon)
+        current_aqi = pm25_to_aqi(raw.get("pm25", 0))
+    except Exception as e:
+        print(f"[inference] fetch_current failed: {e}")
+        return {
+            "current_aqi": 0,
+            "aqi_24h": 0, "aqi_48h": 0, "aqi_72h": 0,
+            "lower_24h": 0, "upper_24h": 0,
+            "error": f"Could not fetch live data: {e}",
+        }
 
-    df_row = pd.DataFrame([row])
+    # Step 2: feature history (use empty df on failure — lags will be 0)
+    try:
+        history = get_recent_features(city=city)
+    except Exception as e:
+        print(f"[inference] get_recent_features failed: {e}")
+        history = pd.DataFrame()
 
-    # Load champion model + scaler
+    # Step 3: build feature row
+    try:
+        ts  = datetime.now(timezone.utc)
+        row = build_feature_row(raw, history, ts)
+        df_row = pd.DataFrame([row])
+    except Exception as e:
+        print(f"[inference] build_feature_row failed: {e}")
+        return {
+            "current_aqi": current_aqi,
+            "aqi_24h": current_aqi, "aqi_48h": current_aqi, "aqi_72h": current_aqi,
+            "lower_24h": current_aqi * 0.85, "upper_24h": current_aqi * 1.15,
+            "error": f"Feature engineering failed: {e}",
+        }
+
+    # Step 4: load model
     model, scaler = load_champion_model()
     if model is None:
         return {
             "current_aqi": current_aqi,
             "aqi_24h": current_aqi, "aqi_48h": current_aqi, "aqi_72h": current_aqi,
-            "lower_24h": current_aqi, "upper_24h": current_aqi,
-            "error": "No champion model available yet. Run training pipeline first.",
+            "lower_24h": current_aqi * 0.85, "upper_24h": current_aqi * 1.15,
+            "error": "No champion model yet — run the training pipeline first.",
         }
 
-    # Scale
-    if scaler is not None:
-        df_row = apply_scaler(df_row, scaler)
-
-    drop_cols = ["timestamp", "city", "aqi_24h", "aqi_48h", "aqi_72h"]
-    feat_cols  = [c for c in df_row.columns if c not in drop_cols and df_row[c].dtype != object]
-    X = df_row[feat_cols].values
-
-    # Predict — handle Keras LSTM models that expect 3D input
+    # Step 5: scale + predict
     try:
-        import tensorflow as tf
-        if isinstance(model, tf.keras.Model):
-            # LSTM/Sequential expects (batch, timesteps, features)
-            # We only have 1 timestep here so reshape accordingly.
-            # If the model was trained on a different feature count, it will
-            # still fail — the next training run on v2 data will produce a
-            # sklearn/XGBoost champion that works without this reshape.
-            expected_features = model.input_shape[-1]
-            if X.shape[1] != expected_features:
-                return {
-                    "current_aqi": current_aqi,
-                    "aqi_24h": current_aqi, "aqi_48h": current_aqi, "aqi_72h": current_aqi,
-                    "lower_24h": current_aqi * 0.85, "upper_24h": current_aqi * 1.15,
-                    "error": (
-                        f"Champion model (LSTM) was trained on {expected_features} features but "
-                        f"current feature set has {X.shape[1]}. "
-                        "Run the training pipeline to promote a new champion trained on v2 data."
-                    ),
-                }
-            X = X.reshape(1, 1, expected_features)
-    except ImportError:
-        pass
+        if scaler is not None:
+            df_row = apply_scaler(df_row, scaler)
 
-    preds = model.predict(X)[0]   # shape (3,) for 3 horizons
-    if preds.ndim == 0:
-        preds = np.array([preds, preds, preds])
+        drop_cols = ["timestamp", "city", "aqi_24h", "aqi_48h", "aqi_72h"]
+        feat_cols  = [c for c in df_row.columns if c not in drop_cols and df_row[c].dtype != object]
+        X = df_row[feat_cols].values
 
-    aqi_24h = float(np.clip(preds[0], 0, 500))
-    aqi_48h = float(np.clip(preds[1] if len(preds) > 1 else preds[0], 0, 500))
-    aqi_72h = float(np.clip(preds[2] if len(preds) > 2 else preds[0], 0, 500))
+        # Keras LSTM shape guard
+        try:
+            import tensorflow as tf
+            if isinstance(model, tf.keras.Model):
+                expected_features = model.input_shape[-1]
+                if X.shape[1] != expected_features:
+                    return {
+                        "current_aqi": current_aqi,
+                        "aqi_24h": current_aqi, "aqi_48h": current_aqi, "aqi_72h": current_aqi,
+                        "lower_24h": current_aqi * 0.85, "upper_24h": current_aqi * 1.15,
+                        "error": (
+                            f"Champion (LSTM) trained on {expected_features} features, "
+                            f"current set has {X.shape[1]}. "
+                            "Training pipeline will fix this on next run."
+                        ),
+                    }
+                X = X.reshape(1, 1, expected_features)
+        except ImportError:
+            pass
 
-    # Conformal intervals for 24h prediction
+        preds = model.predict(X)[0]
+        if preds.ndim == 0:
+            preds = np.array([preds, preds, preds])
+
+        aqi_24h = float(np.clip(preds[0], 0, 500))
+        aqi_48h = float(np.clip(preds[1] if len(preds) > 1 else preds[0], 0, 500))
+        aqi_72h = float(np.clip(preds[2] if len(preds) > 2 else preds[0], 0, 500))
+
+    except Exception as e:
+        print(f"[inference] predict failed: {e}")
+        return {
+            "current_aqi": current_aqi,
+            "aqi_24h": current_aqi, "aqi_48h": current_aqi, "aqi_72h": current_aqi,
+            "lower_24h": current_aqi * 0.85, "upper_24h": current_aqi * 1.15,
+            "error": f"Prediction failed: {e}",
+        }
+
+    # Step 6: conformal intervals
     mapie = load_calibrator()
-    lower_24h, upper_24h = aqi_24h * 0.85, aqi_24h * 1.15  # fallback ±15%
+    lower_24h, upper_24h = aqi_24h * 0.85, aqi_24h * 1.15
     if mapie is not None:
         try:
             _, lo, hi = predict_with_intervals(mapie, X)
@@ -338,7 +372,14 @@ def load_all_models_metadata() -> list[dict]:
             try:
                 models = mr.get_models(name=model_name)  # 4.7 requires name kwarg
                 for m in (models or []):
-                    tm = m.training_metrics or {}
+                    # Use training_metrics attribute directly — does NOT trigger a download.
+                    # Avoid m.download() here; that causes [Errno 5] when /tmp cert files
+                    # from a previous login session are stale or locked.
+                    tm = {}
+                    try:
+                        tm = m.training_metrics or {}
+                    except Exception:
+                        pass
                     results.append({
                         "name":        m.name,
                         "version":     m.version,
@@ -350,11 +391,12 @@ def load_all_models_metadata() -> list[dict]:
                         "is_champion": m.name == "aqi_champion",
                     })
             except Exception:
-                pass  # model name simply doesn't exist in registry yet — skip silently
+                pass  # model name simply doesn't exist yet — skip silently
 
         data = results if results else [{"name": "No models registered yet", "version": "-", "status": "challenger"}]
     except Exception as e:
-        data = [{"name": f"Error loading models: {e}", "version": "-"}]
+        print(f"[inference] load_all_models_metadata failed: {e}")
+        data = [{"name": f"Hopsworks unavailable: {e}", "version": "-"}]
 
     with _cache_lock:
         _METADATA_CACHE["data"] = data

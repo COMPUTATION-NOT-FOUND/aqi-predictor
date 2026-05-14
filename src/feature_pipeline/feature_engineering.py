@@ -241,8 +241,11 @@ def fit_scaler(df: pd.DataFrame) -> RobustScaler:
     df = _log_transform(df.copy())
     num_cols = [c for c in df.select_dtypes(include=np.number).columns
                 if c not in SKIP_COLS]
+    # Guard against inf/NaN from ratios or pct_change on zero values
+    df[num_cols] = df[num_cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
     scaler = RobustScaler()
     scaler.fit(df[num_cols])
+
     scaler.feature_names_ = num_cols
     with open(SCALER_PATH, "wb") as f:
         pickle.dump(scaler, f)

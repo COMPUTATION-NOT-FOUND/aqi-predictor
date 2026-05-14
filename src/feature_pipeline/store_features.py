@@ -43,23 +43,35 @@ def insert_features(df: pd.DataFrame):
 
 
 def fetch_training_data(start_time: str = None, end_time: str = None) -> pd.DataFrame:
-    """Pull all historical features from Hopsworks for model training."""
+    """Pull all historical features from Hopsworks for model training.
+
+    Tries the Feature View first (preferred). Falls back to direct Feature Group
+    read if the Feature View returns empty — this happens on Hopsworks free tier
+    when offline materialization Spark jobs fail.
+    """
     fs = get_feature_store()
     fg = fs.get_feature_group(name=HOPSWORKS_FG_NAME, version=FEATURE_VERSION)
     fv_name = "aqi_feature_view"
 
+    # Try feature view first
     try:
         fv = fs.get_feature_view(name=fv_name, version=FEATURE_VERSION)
-    except Exception:
-        fv = None
+        df = fv.get_batch_data(start_time=start_time, end_time=end_time)
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        if len(df) > 10:
+            return df
+        print(f"[store_features] Feature view returned {len(df)} rows — falling back to direct FG read")
+    except Exception as e:
+        print(f"[store_features] Feature view read failed ({e}) — falling back to direct FG read")
 
-    if fv is None:
-        fs.create_feature_view(
-            name=fv_name,
-            version=FEATURE_VERSION,
-            query=fg.select_all(),
-        )
-        fv = fs.get_feature_view(name=fv_name, version=FEATURE_VERSION)
+    # Fallback: read directly from the feature group
+    try:
+        df = fg.read()
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        print(f"[store_features] Direct FG read returned {len(df)} rows")
+        return df
+    except Exception as e2:
+        print(f"[store_features] Direct FG read also failed: {e2}")
+        return pd.DataFrame()
 
-    df = fv.get_batch_data(start_time=start_time, end_time=end_time)
-    return df.sort_values("timestamp").reset_index(drop=True)
+

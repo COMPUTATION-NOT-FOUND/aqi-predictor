@@ -282,7 +282,10 @@ def apply_scaler(df: pd.DataFrame, scaler: RobustScaler) -> pd.DataFrame:
         if col in df.columns:
             arr[:, i] = df[col].values
 
+    # Guard: replace inf/nan before transform
+    arr = np.where(np.isfinite(arr), arr, 0.0)
     scaled = scaler.transform(arr)
+
 
     # Write back only the columns that actually exist in df
     for i, col in enumerate(scaler_cols):

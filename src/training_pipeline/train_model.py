@@ -100,7 +100,9 @@ def load_and_split():
     drop_meta = ["timestamp", "city"] + TARGET_COLS
     feature_cols = [c for c in df.columns if c not in drop_meta and df[c].dtype != object]
 
-    X = df[feature_cols].values
+    X = df[feature_cols].values.astype(np.float64)
+    # Sanitize: replace inf/-inf/NaN with 0 (can come from pm_ratio or pct_change on zero)
+    X = np.where(np.isfinite(X), X, 0.0)
     Y = df[TARGET_COLS].values       # shape (n, 3)
 
     n = len(X)

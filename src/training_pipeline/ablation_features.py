@@ -64,7 +64,8 @@ def run_ablation(df: pd.DataFrame):
         print("[ablation_features] Not enough data for ablation — skipping")
         return
 
-    X_full = df_clean[feature_cols].values
+    X_full = df_clean[feature_cols].values.astype(np.float64)
+    X_full = np.where(np.isfinite(X_full), X_full, 0.0)  # guard inf/NaN from pm_ratio/pct_change
     y      = df_clean[TARGET_COL].values
 
     # Baseline with all features

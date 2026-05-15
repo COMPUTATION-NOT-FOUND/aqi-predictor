@@ -39,7 +39,7 @@ def calibrate(model, X_cal: np.ndarray, y_cal: np.ndarray) -> SplitConformalRegr
     _, intervals = mapie.predict_interval(X_cal)
     lower = intervals[:, 0, 0]
     upper = intervals[:, 1, 0]
-    coverage = regression_coverage_score(y_cal, intervals[:, :, 0])
+    coverage = float(regression_coverage_score(y_cal, intervals[:, :, 0]))
     print(f"[conformal] Calibration coverage: {coverage:.3f} (target: {COVERAGE_LEVEL})")
     return mapie
 

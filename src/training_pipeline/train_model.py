@@ -32,6 +32,7 @@ import shap
 import pickle
 from pathlib import Path
 from datetime import datetime, timezone
+from sklearn.base import BaseEstimator
 from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import StackingRegressor, VotingRegressor
@@ -84,7 +85,7 @@ class KerasWrapper:
     def predict(self, X): return self.model.predict(X, verbose=0)
 
 
-class _FirstOutputWrapper:
+class _FirstOutputWrapper(BaseEstimator):
     def __init__(self, model): self.model = model
     def fit(self, X, y): return self
     def predict(self, X): return self.model.predict(X)[:, 0]

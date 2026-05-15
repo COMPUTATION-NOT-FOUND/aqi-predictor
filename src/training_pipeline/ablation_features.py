@@ -64,9 +64,13 @@ def run_ablation(df: pd.DataFrame):
         print("[ablation_features] Not enough data for ablation — skipping")
         return
 
+    # Sanitize once here; all X slices below come from this clean array
     X_full = df_clean[feature_cols].values.astype(np.float64)
-    X_full = np.where(np.isfinite(X_full), X_full, 0.0)  # guard inf/NaN from pm_ratio/pct_change
+    X_full = np.where(np.isfinite(X_full), X_full, 0.0)
     y      = df_clean[TARGET_COL].values
+
+    # Build a column-index map so X_reduced slices the sanitized X_full
+    col_idx = {col: i for i, col in enumerate(feature_cols)}
 
     # Baseline with all features
     baseline_rmse = _cv_rmse(X_full, y)
@@ -93,7 +97,7 @@ def run_ablation(df: pd.DataFrame):
         if len(reduced_cols) == 0:
             continue
 
-        X_reduced = df_clean[reduced_cols].values
+        X_reduced = X_full[:, [col_idx[c] for c in reduced_cols]]
         group_rmse = _cv_rmse(X_reduced, y)
         delta = group_rmse - baseline_rmse
 

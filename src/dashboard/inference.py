@@ -48,6 +48,9 @@ _SHAP_CACHE: dict = {"data": None, "ts": None}
 _SHAP_CACHE_TTL = 3600       # 1 hour — SHAP only changes after training pipeline runs
 
 _cache_lock = threading.Lock()
+# Serializes all hopsworks.login() calls — the SDK uses a global connection
+# singleton and concurrent logins from different threads corrupt TLS certs.
+_hopsworks_lock = threading.Lock()
 
 
 # ─── Champion model ───────────────────────────────────────────────────────────
@@ -67,31 +70,35 @@ def load_champion_model():
 
     import traceback
     print(f"[inference] Connecting to Hopsworks project='{HOPSWORKS_PROJECT}' key={'SET' if HOPSWORKS_API_KEY else 'MISSING'}")
-    try:
-        project = hopsworks.login(
-            api_key_value=HOPSWORKS_API_KEY,
-            project=HOPSWORKS_PROJECT,
-        )
-    except Exception as e:
-        print(f"[inference] HOPSWORKS LOGIN FAILED: {e}\n{traceback.format_exc()}")
-        return None, None
-
-    mr = project.get_model_registry()
-    try:
-        models = mr.get_models(name="aqi_champion")
-        if not models:
-            print("[inference] No 'aqi_champion' model found in registry")
+    with _hopsworks_lock:
+        try:
+            project = hopsworks.login(
+                api_key_value=HOPSWORKS_API_KEY,
+                project=HOPSWORKS_PROJECT,
+            )
+        except Exception as e:
+            print(f"[inference] HOPSWORKS LOGIN FAILED: {e}\n{traceback.format_exc()}")
             return None, None
-        best = models[-1]
-        print(f"[inference] Found aqi_champion v{best.version} — downloading...")
-        model_dir = best.download()
 
-        # Detect model format via marker written at training time
+        mr = project.get_model_registry()
+        try:
+            models = mr.get_models(name="aqi_champion")
+            if not models:
+                print("[inference] No 'aqi_champion' model found in registry")
+                return None, None
+            best = models[-1]
+            print(f"[inference] Found aqi_champion v{best.version} — downloading...")
+            model_dir = best.download()
+        except Exception as e:
+            print(f"[inference] CHAMPION LOAD FAILED: {e}\n{traceback.format_exc()}")
+            return None, None
+
+    # Model file I/O happens outside the lock — doesn't need the Hopsworks connection
+    try:
         type_file = Path(model_dir) / "model_type.txt"
         model_type = type_file.read_text().strip() if type_file.exists() else "sklearn"
 
         if model_type == "keras":
-            # Keras MLP distilled student
             try:
                 import tensorflow as tf
                 model = tf.keras.models.load_model(f"{model_dir}/model.keras")
@@ -102,7 +109,6 @@ def load_champion_model():
                       "or re-run training so a sklearn/XGBoost model wins the champion slot.")
                 return None, None
         else:
-            # sklearn / XGBoost / CatBoost — safe to unpickle without keras
             try:
                 with open(f"{model_dir}/model.pkl", "rb") as f:
                     model = pickle.load(f)
@@ -149,7 +155,8 @@ def get_recent_features(city: str = DEFAULT_CITY, n: int = 48) -> pd.DataFrame:
             return cached["data"]
 
     print("[inference] Fetching feature history from Hopsworks...")
-    df = fetch_training_data()
+    with _hopsworks_lock:
+        df = fetch_training_data()
     if "city" in df.columns:
         df = df[df["city"] == city]
     result = df.tail(n)
@@ -482,38 +489,40 @@ def load_all_models_metadata() -> list[dict]:
         "LSTM", "distilled_student",
     ]
     try:
-        project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
-        mr = project.get_model_registry()
-        results = []
-        for model_name in KNOWN_MODEL_NAMES:
-            try:
-                models = mr.get_models(name=model_name)  # 4.7 requires name kwarg
-                for m in (models or []):
-                    # Use training_metrics attribute directly — does NOT trigger a download.
-                    # Avoid m.download() here; that causes [Errno 5] when /tmp cert files
-                    # from a previous login session are stale or locked.
-                    tm = {}
-                    try:
-                        tm = m.training_metrics or {}
-                    except Exception:
-                        pass
-                    results.append({
-                        "name":        m.name,
-                        "version":     m.version,
-                        "rmse":        tm.get("rmse", None),
-                        "ioa":         tm.get("ioa",  None),
-                        "skill_score": tm.get("skill_score", None),
-                        "oof_rmse":    tm.get("oof_rmse", None),
-                        "overfit":     bool(tm.get("overfit_flag", 0)),
-                        "is_champion": m.name == "aqi_champion",
-                    })
-            except Exception:
-                pass  # model name simply doesn't exist yet — skip silently
+        with _hopsworks_lock:
+            project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
+            mr = project.get_model_registry()
+            results = []
+            for model_name in KNOWN_MODEL_NAMES:
+                try:
+                    models = mr.get_models(name=model_name)  # 4.7 requires name kwarg
+                    for m in (models or []):
+                        # Use training_metrics attribute directly — does NOT trigger a download.
+                        # Avoid m.download() here; that causes [Errno 5] when /tmp cert files
+                        # from a previous login session are stale or locked.
+                        tm = {}
+                        try:
+                            tm = m.training_metrics or {}
+                        except Exception:
+                            pass
+                        results.append({
+                            "name":        m.name,
+                            "version":     m.version,
+                            "rmse":        tm.get("rmse", None),
+                            "ioa":         tm.get("ioa",  None),
+                            "skill_score": tm.get("skill_score", None),
+                            "oof_rmse":    tm.get("oof_rmse", None),
+                            "overfit":     bool(tm.get("overfit_flag", 0)),
+                            "is_champion": m.name == "aqi_champion",
+                        })
+                except Exception:
+                    pass  # model name simply doesn't exist yet — skip silently
 
         data = results if results else [{"name": "No models registered yet", "version": "-", "status": "challenger"}]
     except Exception as e:
         print(f"[inference] load_all_models_metadata failed: {e}")
-        data = [{"name": f"Hopsworks unavailable: {e}", "version": "-"}]
+        # Do NOT cache — let the next tab click retry fresh
+        return [{"name": f"Hopsworks unavailable: {e}", "version": "-"}]
 
     with _cache_lock:
         _METADATA_CACHE["data"] = data

@@ -132,8 +132,11 @@ def migrate():
     # ensure timestamp dtype is correct
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
-    fg_v2.insert(df, write_options={"wait_for_job": True})
-    print(f"[migrate] ✓ Migration complete — {len(df):,} rows now in v{V2}.")
+    fg_v2.insert(df, write_options={"wait_for_job": False})
+    print(f"[migrate] ✓ Insert submitted for {len(df):,} rows into v{V2}.")
+    print("[migrate] NOTE: Offline materialization runs async as a Spark job in Hopsworks.")
+    print("[migrate]       Check the Jobs UI — if it stays 'Initializing' for >10 min on")
+    print("[migrate]       the free tier, kill it and re-run. The insert itself succeeded.")
     print("[migrate] You can now run the hourly pipeline and the training pipeline against v2.")
 
 

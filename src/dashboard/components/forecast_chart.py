@@ -162,7 +162,7 @@ def build_hindcast_chart(
             fig.add_trace(go.Scatter(
                 x=ts_oof, y=pred, mode="lines+markers",
                 name="OOF Predictions (model)",
-                line=dict(color="#f38ba8", width=1.5, dash="dash"),
+                line=dict(color="#f38ba8", width=2, dash="dot"),
                 marker=dict(size=4, color="#f38ba8"),
                 hovertemplate="%{y:.0f}<extra>OOF Predicted</extra>",
             ))

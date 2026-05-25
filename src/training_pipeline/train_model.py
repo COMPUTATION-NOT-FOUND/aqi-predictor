@@ -139,6 +139,38 @@ def _oof_rmse(estimator, X, Y, n_splits=N_SPLITS_OOF) -> float:
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 
+def _save_champion_oof_predictions(model, X_train, Y_train, df_train) -> None:
+    """Save per-sample OOF predictions for the champion model to MongoDB.
+
+    These are read by the dashboard's hindcast chart (Panel B) to overlay
+    model predictions on observed AQI without any data leakage.
+    """
+    from src.db import get_db
+    tscv = TimeSeriesSplit(n_splits=N_SPLITS_OOF)
+    val_indices, preds_24h, obs_24h = [], [], []
+    for tr, val in tscv.split(X_train):
+        model.fit(X_train[tr], Y_train[tr])
+        p = np.asarray(model.predict(X_train[val]))
+        val_indices.extend(val.tolist())
+        preds_24h.extend((p[:, 0] if p.ndim == 2 else p).tolist())
+        obs_24h.extend(Y_train[val, 0].tolist())
+
+    city = str(df_train["city"].iloc[0]) if "city" in df_train.columns else "karachi"
+    docs = []
+    for idx, pred, obs in zip(val_indices, preds_24h, obs_24h):
+        ts = df_train["timestamp"].iloc[idx]
+        if hasattr(ts, "to_pydatetime"):
+            ts = ts.to_pydatetime()
+        docs.append({"timestamp": ts, "city": city,
+                     "predicted": float(pred), "observed": float(obs)})
+
+    if docs:
+        col = get_db()["oof_predictions"]
+        col.delete_many({})
+        col.insert_many(docs)
+        print(f"[train] Saved {len(docs)} OOF prediction rows to MongoDB")
+
+
 def train_classical(X_train, Y_train, X_test, Y_test, y_persistence, scaler) -> list[dict]:
     results = []
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
@@ -485,6 +517,23 @@ def main():
     for r in keras_results:
         r["metrics"]["champion_eligible"] = 0  # informational only
     register_all(sklearn_results + keras_results, champion_eligible_names={r["name"] for r in sklearn_results})
+
+    # 13. Save champion OOF predictions for hindcast chart
+    try:
+        from src.db import get_db as _get_db
+        _champ_meta = _get_db()["model_metadata"].find_one(
+            {"model_name": "aqi_champion"}, {"promoted_from": 1}
+        )
+        _champ_name = (_champ_meta or {}).get("promoted_from")
+        _champ_result = next((r for r in sklearn_results if r["name"] == _champ_name), None)
+        if _champ_result:
+            _save_champion_oof_predictions(
+                _champ_result["model"], X_train, Y_train, df.iloc[:len(X_train)]
+            )
+        else:
+            print(f"[train] OOF save skipped — champion '{_champ_name}' not found in results")
+    except Exception as e:
+        print(f"[train] OOF save failed (non-fatal): {e}")
 
     # Summary
     print(f"\n{'='*60}")

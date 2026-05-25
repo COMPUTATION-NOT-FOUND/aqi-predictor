@@ -166,6 +166,14 @@ def fill_shap(_):
 
 # ─── Render helpers ───────────────────────────────────────────────────────────
 
+def _load_oof():
+    try:
+        from src.feature_pipeline.store_features import fetch_oof_predictions
+        return fetch_oof_predictions(DEFAULT_CITY)
+    except Exception:
+        return None
+
+
 def _render_forecast():
     from src.dashboard.inference import predict_3day, get_recent_features
     try:
@@ -268,7 +276,7 @@ def _render_forecast():
         dbc.Row(dbc.Col(
             dcc.Graph(
                 id="chart-hindcast",
-                figure=build_hindcast_chart(history, None),  # OOF df populated from MLflow if available
+                figure=build_hindcast_chart(history, _load_oof()),
                 config={"displayModeBar": True},
                 style={"height": "300px"},
             ), width=12,

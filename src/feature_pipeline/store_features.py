@@ -58,6 +58,18 @@ def fetch_training_data(start_time: str = None, end_time: str = None) -> pd.Data
     return df.reset_index(drop=True)
 
 
+def fetch_oof_predictions(city: str = "karachi") -> pd.DataFrame:
+    """Return saved OOF predictions for the champion model (used by the hindcast chart)."""
+    col = get_db()["oof_predictions"]
+    cursor = col.find({"city": city}, {"_id": 0}).sort("timestamp", 1)
+    rows = list(cursor)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    return df
+
+
 def fetch_recent(city: str, n: int = 72) -> pd.DataFrame:
     """Fetch the most recent n feature rows for a city.
 

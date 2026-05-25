@@ -36,17 +36,30 @@ from src.training_pipeline.conformal import load_calibrator, predict_with_interv
 SHAP_PATH = Path(__file__).parent.parent.parent / "shap_values.pkl"
 
 # ─── Module-level caches ──────────────────────────────────────────────────────
-_MODEL_CACHE: dict = {"model": None, "scaler": None}
 
+# Model cache: stores model + scaler + the champion's trained_at version string.
+# Never re-downloads unless MongoDB shows a newer champion (checked every hour).
+_MODEL_CACHE: dict = {"model": None, "scaler": None, "version": None, "checked_at": None}
+_MODEL_VERSION_CHECK_INTERVAL = 3600   # re-query MongoDB for champion version once per hour
+
+# Feature history: TTL matches the dashboard refresh interval (5 min).
+# No point caching for 1 hour when the page already refreshes every 5 min.
 _FEATURES_CACHE: dict = {"data": None, "city": None, "ts": None}
-_FEATURES_CACHE_TTL = 3600
+_FEATURES_CACHE_TTL = 300              # 5 minutes
 
+# Leaderboard metadata: changes only after daily training run.
 _METADATA_CACHE: dict = {"data": None, "ts": None}
-_METADATA_CACHE_TTL = 1800
+_METADATA_CACHE_TTL = 1800             # 30 minutes
 
+# SHAP values: changes only after daily training run.
 _SHAP_CACHE: dict = {"data": None, "ts": None}
-_SHAP_CACHE_TTL = 3600
+_SHAP_CACHE_TTL = 3600                 # 1 hour
 
+# Conformal calibrator: loaded from disk or GridFS — cache to avoid repeated I/O.
+_CONFORMAL_CACHE: dict = {"calibrator": None, "ts": None}
+_CONFORMAL_CACHE_TTL = 3600            # 1 hour
+
+# Single lock protecting all in-memory cache mutations.
 _cache_lock = threading.Lock()
 
 _PREDICTION_LOG_TTL_DAYS = 30
@@ -54,64 +67,111 @@ _PREDICTION_LOG_TTL_DAYS = 30
 
 # ─── Champion model ───────────────────────────────────────────────────────────
 
+def _fetch_champion_version() -> str | None:
+    """Query MongoDB for the current champion's trained_at timestamp. Returns None on error."""
+    try:
+        meta = get_db()["model_metadata"].find_one(
+            {"model_name": "aqi_champion"}, {"trained_at": 1, "artifacts_gridfs_id": 1}
+        )
+        if meta and meta.get("artifacts_gridfs_id"):
+            return meta.get("trained_at", "unknown")
+    except Exception:
+        pass
+    return None
+
+
 def load_champion_model():
     """Download and cache the champion model from MongoDB GridFS.
 
-    The champion ZIP contains: model.pkl/model.keras, model_type.txt,
-    scaler_bundle.pkl, shap_values.pkl, conformal_calibrator.pkl.
-    """
-    with _cache_lock:
-        if _MODEL_CACHE["model"] is not None:
-            print("[inference] Returning cached champion model")
-            return _MODEL_CACHE["model"], _MODEL_CACHE["scaler"]
+    Cache invalidation: re-queries MongoDB for the champion's trained_at version
+    once per _MODEL_VERSION_CHECK_INTERVAL seconds. If the version changed
+    (new champion promoted), evicts the cache and re-downloads automatically.
 
+    Race condition protection: the lock is held for the entire download so only
+    one thread downloads; subsequent threads wait and then return the cached copy.
+    """
     import traceback
-    try:
-        meta = get_db()["model_metadata"].find_one(
-            {"model_name": "aqi_champion"}, {"_id": 0}
-        )
-        if not meta or not meta.get("artifacts_gridfs_id"):
+    now = datetime.now(timezone.utc)
+
+    with _cache_lock:
+        cached_model   = _MODEL_CACHE["model"]
+        cached_version = _MODEL_CACHE["version"]
+        checked_at     = _MODEL_CACHE["checked_at"]
+
+        # Fast path: model loaded and version check not due yet
+        if cached_model is not None and checked_at is not None:
+            elapsed = (now - checked_at).total_seconds()
+            if elapsed < _MODEL_VERSION_CHECK_INTERVAL:
+                print("[inference] Returning cached champion model")
+                return cached_model, _MODEL_CACHE["scaler"]
+
+        # Version check due (or first load) — query MongoDB inside the lock
+        # so only one thread does the check + possible download
+        current_version = _fetch_champion_version()
+        if current_version is None:
+            if cached_model is not None:
+                # MongoDB unreachable but we have a cached model — keep serving it
+                _MODEL_CACHE["checked_at"] = now
+                return cached_model, _MODEL_CACHE["scaler"]
             print("[inference] No champion model artifacts found in MongoDB")
             return None, None
 
-        print("[inference] Downloading champion artifacts from GridFS...")
-        zip_bytes = get_gridfs().get(meta["artifacts_gridfs_id"]).read()
-        buf = io.BytesIO(zip_bytes)
-        model = None
-        scaler = None
+        _MODEL_CACHE["checked_at"] = now
 
-        with zipfile.ZipFile(buf, "r") as zf:
-            model_type = "sklearn"
-            if "model_type.txt" in zf.namelist():
-                model_type = zf.read("model_type.txt").decode().strip()
+        if cached_model is not None and current_version == cached_version:
+            print(f"[inference] Champion unchanged (version={current_version}) — using cache")
+            return cached_model, _MODEL_CACHE["scaler"]
 
-            if model_type == "keras":
-                try:
-                    import tempfile
-                    import tensorflow as tf
-                    with tempfile.TemporaryDirectory() as td:
-                        zf.extract("model.keras", td)
-                        model = tf.keras.models.load_model(os.path.join(td, "model.keras"))
-                    print("[inference] Champion Keras model loaded")
-                except ImportError:
-                    print("[inference] Champion is Keras but tensorflow not installed — "
-                          "re-run training so a sklearn model wins the champion slot")
-                    return None, None
-            else:
-                model = pickle.loads(zf.read("model.pkl"))
-                print("[inference] Champion sklearn model loaded")
+        if cached_model is not None:
+            print(f"[inference] New champion detected ({cached_version} → {current_version}) — reloading")
+        else:
+            print(f"[inference] Loading champion model version={current_version}...")
 
-            if "scaler_bundle.pkl" in zf.namelist():
-                scaler = pickle.loads(zf.read("scaler_bundle.pkl"))
+        # Download inside the lock — other threads block here and then return
+        # the freshly cached model, avoiding duplicate downloads
+        try:
+            meta = get_db()["model_metadata"].find_one({"model_name": "aqi_champion"})
+            zip_bytes = get_gridfs().get(meta["artifacts_gridfs_id"]).read()
+            buf = io.BytesIO(zip_bytes)
+            model = None
+            scaler = None
 
-        with _cache_lock:
-            _MODEL_CACHE["model"]  = model
-            _MODEL_CACHE["scaler"] = scaler
-        return model, scaler
+            with zipfile.ZipFile(buf, "r") as zf:
+                model_type = "sklearn"
+                if "model_type.txt" in zf.namelist():
+                    model_type = zf.read("model_type.txt").decode().strip()
 
-    except Exception as e:
-        print(f"[inference] CHAMPION LOAD FAILED: {e}\n{traceback.format_exc()}")
-        return None, None
+                if model_type == "keras":
+                    try:
+                        import tempfile
+                        import tensorflow as tf
+                        with tempfile.TemporaryDirectory() as td:
+                            zf.extract("model.keras", td)
+                            model = tf.keras.models.load_model(os.path.join(td, "model.keras"))
+                        print("[inference] Champion Keras model loaded")
+                    except ImportError:
+                        print("[inference] Champion is Keras but tensorflow not installed")
+                        return None, None
+                else:
+                    model = pickle.loads(zf.read("model.pkl"))
+                    print("[inference] Champion sklearn model loaded")
+
+                if "scaler_bundle.pkl" in zf.namelist():
+                    scaler = pickle.loads(zf.read("scaler_bundle.pkl"))
+
+            _MODEL_CACHE["model"]   = model
+            _MODEL_CACHE["scaler"]  = scaler
+            _MODEL_CACHE["version"] = current_version
+            # Also invalidate SHAP and conformal caches since a new model was loaded
+            _SHAP_CACHE["data"]           = None
+            _SHAP_CACHE["ts"]             = None
+            _CONFORMAL_CACHE["calibrator"] = None
+            _CONFORMAL_CACHE["ts"]         = None
+            return model, scaler
+
+        except Exception as e:
+            print(f"[inference] CHAMPION LOAD FAILED: {e}\n{traceback.format_exc()}")
+            return None, None
 
 
 # ─── Feature history ──────────────────────────────────────────────────────────
@@ -137,6 +197,26 @@ def get_recent_features(city: str = DEFAULT_CITY, n: int = 48) -> pd.DataFrame:
         _FEATURES_CACHE["city"] = city
         _FEATURES_CACHE["ts"]   = now
     return result
+
+
+# ─── Conformal calibrator cache ───────────────────────────────────────────────
+
+def _get_cached_calibrator():
+    """Return cached conformal calibrator, reloading after TTL expiry."""
+    now = datetime.now(timezone.utc)
+    with _cache_lock:
+        if (
+            _CONFORMAL_CACHE["calibrator"] is not None
+            and _CONFORMAL_CACHE["ts"] is not None
+            and (now - _CONFORMAL_CACHE["ts"]).total_seconds() < _CONFORMAL_CACHE_TTL
+        ):
+            return _CONFORMAL_CACHE["calibrator"]
+
+    calibrator = load_calibrator()
+    with _cache_lock:
+        _CONFORMAL_CACHE["calibrator"] = calibrator
+        _CONFORMAL_CACHE["ts"]         = now
+    return calibrator
 
 
 # ─── 3-day prediction ─────────────────────────────────────────────────────────
@@ -245,7 +325,7 @@ def predict_3day(
             "error": f"Prediction failed: {e}",
         }
 
-    mapie = load_calibrator()
+    mapie = _get_cached_calibrator()
     lower_24h, upper_24h = aqi_24h * 0.85, aqi_24h * 1.15
     if mapie is not None:
         try:
@@ -264,14 +344,8 @@ def predict_3day(
         "feature_row": row,
     }
 
-    # Resolve model version from MongoDB metadata
-    try:
-        champ_meta = get_db()["model_metadata"].find_one(
-            {"model_name": "aqi_champion"}, {"trained_at": 1}
-        )
-        model_ver = (champ_meta or {}).get("trained_at", "unknown")
-    except Exception:
-        model_ver = "unknown"
+    with _cache_lock:
+        model_ver = _MODEL_CACHE.get("version") or "unknown"
 
     threading.Thread(
         target=_log_prediction_async,

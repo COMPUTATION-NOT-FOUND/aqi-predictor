@@ -8,8 +8,10 @@ load_dotenv()
 # ─── API Keys ─────────────────────────────────────────────────────────────────
 AQICN_API_KEY       = os.getenv("AQICN_API_KEY")        # FILL IN: https://aqicn.org/api/
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")  # FILL IN: https://openweathermap.org/api
-HOPSWORKS_API_KEY   = os.getenv("HOPSWORKS_API_KEY")    # FILL IN: Hopsworks > Account Settings > API Key
-HOPSWORKS_PROJECT   = os.getenv("HOPSWORKS_PROJECT", "aqi_predictor")  # FILL IN: your Hopsworks project name
+
+# ─── MongoDB ───────────────────────────────────────────────────────────────────
+MONGODB_URI     = os.getenv("MONGODB_URI")               # FILL IN: Atlas SRV connection string
+MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "aqi_db")
 
 # ─── MLflow ───────────────────────────────────────────────────────────────────
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "mlruns")  # FILL IN: set to remote MLflow URL if needed
@@ -22,12 +24,8 @@ DEFAULT_LON     = float(os.getenv("DEFAULT_LON", "67.0011"))   # Karachi longitu
 # ─── Pipeline Config ──────────────────────────────────────────────────────────
 BACKFILL_DAYS        = int(os.getenv("BACKFILL_DAYS", "180"))   # FILL IN: history depth in days
 FORECAST_HOURS       = [24, 48, 72]                             # 3-day forecast targets
-FEATURE_VERSION      = 2  # bumped from 1 — v2 adds aqi_lag_48/72/168h, rolling_min/max_24h, aqi_pct_change_24h
-HOPSWORKS_FG_NAME    = "aqi_features"
-HOPSWORKS_FV_NAME    = "aqi_feature_view"
 
 # ─── Champion-Challenger ──────────────────────────────────────────────────────
-PROMOTION_THRESHOLD  = 0.97  # challenger must beat champion RMSE by ≥3%
 AQI_ALERT_THRESHOLD  = 150   # AQI level that triggers hazardous alert
 
 # ─── Feature Group Toggles ────────────────────────────────────────────────────

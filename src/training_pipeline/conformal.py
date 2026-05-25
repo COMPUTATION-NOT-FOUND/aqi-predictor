@@ -49,25 +49,21 @@ def load_calibrator() -> SplitConformalRegressor:
         with open(CONFORMAL_PATH, "rb") as f:
             return pickle.load(f)
 
-    # Fallback: load from champion model artifact in Hopsworks
+    # Fallback: extract from champion's GridFS artifact ZIP
     # (needed when running on Render with ephemeral filesystem)
     try:
+        import io, zipfile
         import sys, os
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-        from src.config import HOPSWORKS_API_KEY, HOPSWORKS_PROJECT
-        import hopsworks
-        from pathlib import Path as _Path
-        project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
-        mr = project.get_model_registry()
-        models = mr.get_models(name="aqi_champion")
-        if models:
-            model_dir = models[-1].download()
-            remote_cal = _Path(model_dir) / "conformal_calibrator.pkl"
-            if remote_cal.exists():
-                with open(remote_cal, "rb") as f:
-                    return pickle.load(f)
+        from src.db import get_db, get_gridfs
+        meta = get_db()["model_metadata"].find_one({"model_name": "aqi_champion"})
+        if meta and meta.get("artifacts_gridfs_id"):
+            zip_bytes = get_gridfs().get(meta["artifacts_gridfs_id"]).read()
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                if "conformal_calibrator.pkl" in zf.namelist():
+                    return pickle.loads(zf.read("conformal_calibrator.pkl"))
     except Exception as e:
-        print(f"[conformal] Could not load calibrator from Hopsworks: {e}")
+        print(f"[conformal] Could not load calibrator from MongoDB: {e}")
     return None
 
 

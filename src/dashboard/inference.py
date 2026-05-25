@@ -1,33 +1,33 @@
 """
-Load champion model + scaler from Hopsworks and run inference for the dashboard.
+Load champion model from MongoDB and run inference for the dashboard.
 Returns 3-day AQI predictions with conformal prediction intervals.
 
 Caching strategy
 ----------------
-- _MODEL_CACHE    : champion model + scaler — never expires (model only changes on re-deploy)
-- _FEATURES_CACHE : recent feature history — TTL 3600 s (hourly pipeline cadence)
-- _METADATA_CACHE : leaderboard model metadata — TTL 1800 s (enough for a session)
-- _SHAP_CACHE     : SHAP values — TTL 3600 s (only changes after training pipeline runs)
+- _MODEL_CACHE    : champion model + scaler — never expires
+- _FEATURES_CACHE : recent feature history — TTL 3600 s
+- _METADATA_CACHE : leaderboard model metadata — TTL 1800 s
+- _SHAP_CACHE     : SHAP values — TTL 3600 s
 
 All caches survive across Dash callbacks within one container lifecycle.
 A background thread pre-warms _METADATA_CACHE and _SHAP_CACHE at module import
-time so the first tab switch feels instant instead of blocking 30–60 s on Hopsworks.
+time so the first tab switch feels instant.
 """
-import numpy as np
-import pandas as pd
+import io
 import pickle
+import zipfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-import hopsworks
+
+import numpy as np
+import pandas as pd
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-from src.config import (
-    HOPSWORKS_API_KEY, HOPSWORKS_PROJECT, DEFAULT_CITY, DEFAULT_LAT, DEFAULT_LON,
-    FORECAST_HOURS,
-)
-from src.feature_pipeline.store_features import fetch_training_data
+from src.config import DEFAULT_CITY, DEFAULT_LAT, DEFAULT_LON, FORECAST_HOURS
+from src.db import get_db, get_gridfs
+from src.feature_pipeline.store_features import fetch_recent
 from src.feature_pipeline.feature_engineering import load_scaler, apply_scaler, pm25_to_aqi
 from src.feature_pipeline.fetch_data import fetch_current
 from src.feature_pipeline.feature_engineering import build_feature_row
@@ -39,95 +39,76 @@ SHAP_PATH = Path(__file__).parent.parent.parent / "shap_values.pkl"
 _MODEL_CACHE: dict = {"model": None, "scaler": None}
 
 _FEATURES_CACHE: dict = {"data": None, "city": None, "ts": None}
-_FEATURES_CACHE_TTL = 3600   # 1 hour — matches hourly pipeline cadence
+_FEATURES_CACHE_TTL = 3600
 
 _METADATA_CACHE: dict = {"data": None, "ts": None}
-_METADATA_CACHE_TTL = 1800   # 30 min — leaderboard data doesn't change that fast
+_METADATA_CACHE_TTL = 1800
 
 _SHAP_CACHE: dict = {"data": None, "ts": None}
-_SHAP_CACHE_TTL = 3600       # 1 hour — SHAP only changes after training pipeline runs
+_SHAP_CACHE_TTL = 3600
 
 _cache_lock = threading.Lock()
-# Serializes all hopsworks.login() calls — the SDK uses a global connection
-# singleton and concurrent logins from different threads corrupt TLS certs.
-_hopsworks_lock = threading.Lock()
+
+_PREDICTION_LOG_TTL_DAYS = 30
 
 
 # ─── Champion model ───────────────────────────────────────────────────────────
 
 def load_champion_model():
-    """Download and load the champion model from Hopsworks Model Registry.
+    """Download and cache the champion model from MongoDB GridFS.
 
-    Supports two formats written by register_model._save_model_artifact:
-      - model.pkl   → sklearn/XGBoost/CatBoost (no keras needed)
-      - model.keras → Keras MLP student (requires tensorflow)
-    A model_type.txt marker file tells us which format to expect.
+    The champion ZIP contains: model.pkl/model.keras, model_type.txt,
+    scaler_bundle.pkl, shap_values.pkl, conformal_calibrator.pkl.
     """
     with _cache_lock:
         if _MODEL_CACHE["model"] is not None:
-            print("[inference] Returning cached champion model (skipping Hopsworks download)")
+            print("[inference] Returning cached champion model")
             return _MODEL_CACHE["model"], _MODEL_CACHE["scaler"]
 
     import traceback
-    print(f"[inference] Connecting to Hopsworks project='{HOPSWORKS_PROJECT}' key={'SET' if HOPSWORKS_API_KEY else 'MISSING'}")
-    with _hopsworks_lock:
-        try:
-            project = hopsworks.login(
-                api_key_value=HOPSWORKS_API_KEY,
-                project=HOPSWORKS_PROJECT,
-            )
-        except Exception as e:
-            print(f"[inference] HOPSWORKS LOGIN FAILED: {e}\n{traceback.format_exc()}")
-            return None, None
-
-        mr = project.get_model_registry()
-        try:
-            models = mr.get_models(name="aqi_champion")
-            if not models:
-                print("[inference] No 'aqi_champion' model found in registry")
-                return None, None
-            best = models[-1]
-            print(f"[inference] Found aqi_champion v{best.version} — downloading...")
-            model_dir = best.download()
-        except Exception as e:
-            print(f"[inference] CHAMPION LOAD FAILED: {e}\n{traceback.format_exc()}")
-            return None, None
-
-    # Model file I/O happens outside the lock — doesn't need the Hopsworks connection
     try:
-        type_file = Path(model_dir) / "model_type.txt"
-        model_type = type_file.read_text().strip() if type_file.exists() else "sklearn"
+        meta = get_db()["model_metadata"].find_one(
+            {"model_name": "aqi_champion"}, {"_id": 0}
+        )
+        if not meta or not meta.get("artifacts_gridfs_id"):
+            print("[inference] No champion model artifacts found in MongoDB")
+            return None, None
 
-        if model_type == "keras":
-            try:
-                import tensorflow as tf
-                model = tf.keras.models.load_model(f"{model_dir}/model.keras")
-                print("[inference] Champion Keras model loaded successfully")
-            except ImportError:
-                print("[inference] CHAMPION LOAD FAILED: champion is a Keras model but tensorflow "
-                      "is not installed on Render. Add tensorflow to requirements-dashboard.txt, "
-                      "or re-run training so a sklearn/XGBoost model wins the champion slot.")
-                return None, None
-        else:
-            try:
-                with open(f"{model_dir}/model.pkl", "rb") as f:
-                    model = pickle.load(f)
-                print("[inference] Champion sklearn model loaded successfully")
-            except (ImportError, ModuleNotFoundError) as e:
-                print(f"[inference] CHAMPION LOAD FAILED: pickle references a missing package ({e}). "
-                      "Re-run training so a pure sklearn/XGBoost/LightGBM/CatBoost model wins "
-                      "the champion slot, then deploy the updated code.")
-                return None, None
-
-        scaler_path = Path(model_dir) / "scaler_bundle.pkl"
+        print("[inference] Downloading champion artifacts from GridFS...")
+        zip_bytes = get_gridfs().get(meta["artifacts_gridfs_id"]).read()
+        buf = io.BytesIO(zip_bytes)
+        model = None
         scaler = None
-        if scaler_path.exists():
-            with open(scaler_path, "rb") as f:
-                scaler = pickle.load(f)
+
+        with zipfile.ZipFile(buf, "r") as zf:
+            model_type = "sklearn"
+            if "model_type.txt" in zf.namelist():
+                model_type = zf.read("model_type.txt").decode().strip()
+
+            if model_type == "keras":
+                try:
+                    import tempfile
+                    import tensorflow as tf
+                    with tempfile.TemporaryDirectory() as td:
+                        zf.extract("model.keras", td)
+                        model = tf.keras.models.load_model(os.path.join(td, "model.keras"))
+                    print("[inference] Champion Keras model loaded")
+                except ImportError:
+                    print("[inference] Champion is Keras but tensorflow not installed — "
+                          "re-run training so a sklearn model wins the champion slot")
+                    return None, None
+            else:
+                model = pickle.loads(zf.read("model.pkl"))
+                print("[inference] Champion sklearn model loaded")
+
+            if "scaler_bundle.pkl" in zf.namelist():
+                scaler = pickle.loads(zf.read("scaler_bundle.pkl"))
+
         with _cache_lock:
             _MODEL_CACHE["model"]  = model
             _MODEL_CACHE["scaler"] = scaler
         return model, scaler
+
     except Exception as e:
         print(f"[inference] CHAMPION LOAD FAILED: {e}\n{traceback.format_exc()}")
         return None, None
@@ -136,12 +117,7 @@ def load_champion_model():
 # ─── Feature history ──────────────────────────────────────────────────────────
 
 def get_recent_features(city: str = DEFAULT_CITY, n: int = 48) -> pd.DataFrame:
-    """Fetch the most recent n feature rows for the given city.
-
-    Results are cached for _FEATURES_CACHE_TTL seconds so repeated
-    Dash callbacks (tab switches, 5-min refresh) don't re-query Hopsworks.
-    n reduced from 72 → 48: STL needs 48 rows minimum; smaller fetch = faster.
-    """
+    """Fetch the most recent n feature rows for the given city (cached)."""
     now = datetime.now(timezone.utc)
     with _cache_lock:
         cached = _FEATURES_CACHE
@@ -154,12 +130,8 @@ def get_recent_features(city: str = DEFAULT_CITY, n: int = 48) -> pd.DataFrame:
             print("[inference] Returning cached feature history")
             return cached["data"]
 
-    print("[inference] Fetching feature history from Hopsworks...")
-    with _hopsworks_lock:
-        df = fetch_training_data()
-    if "city" in df.columns:
-        df = df[df["city"] == city]
-    result = df.tail(n)
+    print("[inference] Fetching feature history from MongoDB...")
+    result = fetch_recent(city, n=n)
     with _cache_lock:
         _FEATURES_CACHE["data"] = result
         _FEATURES_CACHE["city"] = city
@@ -182,12 +154,8 @@ def predict_3day(
     4. Predict with champion model
     5. Add conformal intervals for aqi_24h
 
-    Returns dict with keys: current_aqi, aqi_24h, aqi_48h, aqi_72h,
-                             lower_24h, upper_24h, feature_row
-    Always returns a valid dict — never raises an exception.
+    Always returns a valid dict — never raises.
     """
-    # Step 1: fetch raw data — isolated so a network blip gives us current_aqi
-    # from cache before we bail out
     current_aqi = 0
     raw = {}
     try:
@@ -202,14 +170,12 @@ def predict_3day(
             "error": f"Could not fetch live data: {e}",
         }
 
-    # Step 2: feature history (use empty df on failure — lags will be 0)
     try:
         history = get_recent_features(city=city)
     except Exception as e:
         print(f"[inference] get_recent_features failed: {e}")
         history = pd.DataFrame()
 
-    # Step 3: build feature row
     try:
         ts  = datetime.now(timezone.utc)
         row = build_feature_row(raw, history, ts)
@@ -223,7 +189,6 @@ def predict_3day(
             "error": f"Feature engineering failed: {e}",
         }
 
-    # Step 4: load model
     model, scaler = load_champion_model()
     if model is None:
         return {
@@ -233,16 +198,14 @@ def predict_3day(
             "error": "No champion model yet — run the training pipeline first.",
         }
 
-    # Step 5: scale + predict
     try:
         if scaler is not None:
             df_row = apply_scaler(df_row, scaler)
 
         drop_cols = ["timestamp", "city", "aqi_24h", "aqi_48h", "aqi_72h"]
-        feat_cols  = [c for c in df_row.columns if c not in drop_cols and df_row[c].dtype != object]
+        feat_cols = [c for c in df_row.columns if c not in drop_cols and df_row[c].dtype != object]
         X = df_row[feat_cols].values
 
-        # Keras LSTM shape guard
         try:
             import tensorflow as tf
             if isinstance(model, tf.keras.Model):
@@ -279,7 +242,6 @@ def predict_3day(
             "error": f"Prediction failed: {e}",
         }
 
-    # Step 6: conformal intervals
     mapie = load_calibrator()
     lower_24h, upper_24h = aqi_24h * 0.85, aqi_24h * 1.15
     if mapie is not None:
@@ -299,8 +261,15 @@ def predict_3day(
         "feature_row": row,
     }
 
-    # Log prediction asynchronously (non-blocking — never fails the dashboard)
-    model_ver = getattr(getattr(_MODEL_CACHE.get("model"), "_hops_version", None), "__str__", lambda: "unknown")()
+    # Resolve model version from MongoDB metadata
+    try:
+        champ_meta = get_db()["model_metadata"].find_one(
+            {"model_name": "aqi_champion"}, {"trained_at": 1}
+        )
+        model_ver = (champ_meta or {}).get("trained_at", "unknown")
+    except Exception:
+        model_ver = "unknown"
+
     threading.Thread(
         target=_log_prediction_async,
         args=(city, current_aqi, aqi_24h, aqi_48h, aqi_72h, model_ver),
@@ -310,12 +279,8 @@ def predict_3day(
 
     return result
 
+
 # ─── Live prediction logging ──────────────────────────────────────────────────
-# Rolling 30-day window: old rows are deleted to stay within Hopsworks free tier.
-# Logging runs in a background daemon thread so it never blocks the dashboard.
-
-_PREDICTION_LOG_TTL_DAYS = 30   # keep 30 days of hourly predictions ≈ 720 rows max
-
 
 def _log_prediction_async(
     city: str,
@@ -325,92 +290,43 @@ def _log_prediction_async(
     aqi_72h: float,
     model_version: str = "unknown",
 ) -> None:
-    """
-    Write one prediction row to the Hopsworks 'aqi_predictions' Feature Group.
+    """Insert one prediction row into prediction_log.
 
-    Enforces a rolling 30-day window — any rows older than _PREDICTION_LOG_TTL_DAYS
-    are deleted before inserting to keep row counts within free-tier limits.
-
-    Called from a daemon thread; all errors are swallowed so the dashboard
-    is never affected by a logging failure.
+    The TTL index on logged_at (expireAfterSeconds=2592000) handles
+    automatic 30-day rolling-window cleanup — no application pruning needed.
     """
     try:
-        import hopsworks as hw
-        project = hw.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
-        fs = project.get_feature_store()
-
         now_utc = datetime.now(timezone.utc)
-        cutoff  = now_utc.timestamp() - (_PREDICTION_LOG_TTL_DAYS * 86400)
-
-        row = {
+        doc = {
             "city":          city,
-            "ts_epoch":      int(now_utc.timestamp()),   # primary key (int epoch)
-            "predicted_24h": round(float(aqi_24h),  2),
-            "predicted_48h": round(float(aqi_48h),  2),
-            "predicted_72h": round(float(aqi_72h),  2),
+            "ts_epoch":      int(now_utc.timestamp()),
+            "logged_at":     now_utc,
+            "predicted_24h": round(float(aqi_24h),     2),
+            "predicted_48h": round(float(aqi_48h),     2),
+            "predicted_72h": round(float(aqi_72h),     2),
             "observed_aqi":  round(float(current_aqi), 2),
             "model_version": str(model_version),
         }
-
-        try:
-            fg = fs.get_feature_group(name="aqi_predictions", version=1)
-        except Exception:
-            # Feature group doesn't exist yet — create it on first call
-            fg = fs.create_feature_group(
-                name="aqi_predictions",
-                version=1,
-                primary_key=["city", "ts_epoch"],
-                description=(
-                    "Live AQI predictions logged by the dashboard. "
-                    f"Rolling {_PREDICTION_LOG_TTL_DAYS}-day window (free-tier friendly)."
-                ),
-                online_enabled=False,
-            )
-
-        import pandas as _pd
-        df_row = _pd.DataFrame([row])
-        fg.insert(df_row, write_options={"wait_for_job": False})
-
-        # ── Rolling window cleanup: delete rows older than cutoff ──────────────
-        # Hopsworks free tier has no automatic TTL; we purge via a time-filtered
-        # read + delete pattern using the offline store.
-        try:
-            existing = fg.select_all().as_of(online=False).read(read_options={"use_hive": False})
-            old_rows = existing[existing["ts_epoch"] < cutoff]
-            if not old_rows.empty:
-                fg.delete(old_rows["ts_epoch"].tolist())
-                print(f"[inference] Pruned {len(old_rows)} old prediction rows "
-                      f"(> {_PREDICTION_LOG_TTL_DAYS} days)")
-        except Exception as prune_err:
-            # Pruning failure is non-critical — log and continue
-            print(f"[inference] Rolling-window prune skipped: {prune_err}")
-
-        print(f"[inference] Logged prediction: city={city} AQI={current_aqi:.0f} "
+        get_db()["prediction_log"].insert_one(doc)
+        print(f"[inference] Logged prediction city={city} AQI={current_aqi:.0f} "
               f"→ 24h={aqi_24h:.0f} 48h={aqi_48h:.0f} 72h={aqi_72h:.0f}")
-
     except Exception as e:
         print(f"[inference] Prediction logging failed (non-fatal): {e}")
 
 
-def load_prediction_log(city: str = DEFAULT_CITY, days: int = 7) -> "pd.DataFrame":
-    """
-    Fetch recent prediction log rows for the hindcast chart.
-
-    Returns a DataFrame with columns: ts_epoch, observed_aqi, predicted_24h,
-    predicted_48h, predicted_72h, model_version.
-    Returns empty DataFrame on any error.
-    """
+def load_prediction_log(city: str = DEFAULT_CITY, days: int = 7) -> pd.DataFrame:
+    """Fetch recent prediction log rows for the hindcast chart."""
     try:
-        import hopsworks as hw
-        project = hw.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
-        fs = project.get_feature_store()
-        fg = fs.get_feature_group(name="aqi_predictions", version=1)
-        cutoff = int((datetime.now(timezone.utc).timestamp()) - days * 86400)
-        df = fg.select_all().as_of(online=False).read(read_options={"use_hive": False})
-        df = df[df["city"] == city]
-        df = df[df["ts_epoch"] >= cutoff]
+        cutoff = int(datetime.now(timezone.utc).timestamp()) - days * 86400
+        cursor = get_db()["prediction_log"].find(
+            {"city": city, "ts_epoch": {"$gte": cutoff}},
+            {"_id": 0, "logged_at": 0},
+        ).sort("ts_epoch", 1)
+        df = pd.DataFrame(list(cursor))
+        if df.empty:
+            return df
         df["timestamp"] = pd.to_datetime(df["ts_epoch"], unit="s", utc=True)
-        return df.sort_values("ts_epoch").reset_index(drop=True)
+        return df.reset_index(drop=True)
     except Exception as e:
         print(f"[inference] load_prediction_log failed (non-fatal): {e}")
         return pd.DataFrame()
@@ -418,12 +334,11 @@ def load_prediction_log(city: str = DEFAULT_CITY, days: int = 7) -> "pd.DataFram
 
 # ─── SHAP data ────────────────────────────────────────────────────────────────
 
-
 def load_shap_data() -> dict:
-    """Load pre-computed SHAP values (cached for _SHAP_CACHE_TTL seconds).
+    """Load pre-computed SHAP values (cached).
 
-    Tries local file first (fast, works in dev). Falls back to Hopsworks
-    model artifact so Render (ephemeral filesystem) can access it.
+    Tries local file first (dev/training run). Falls back to extracting
+    shap_values.pkl from the champion's GridFS artifact ZIP (Render).
     """
     now = datetime.now(timezone.utc)
     with _cache_lock:
@@ -439,19 +354,15 @@ def load_shap_data() -> dict:
         with open(SHAP_PATH, "rb") as f:
             data = pickle.load(f)
     else:
-        # Fallback: download shap_values.pkl bundled alongside champion model artifact
         try:
-            project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
-            mr = project.get_model_registry()
-            models = mr.get_models(name="aqi_champion")
-            if models:
-                model_dir = models[-1].download()
-                shap_remote = Path(model_dir) / "shap_values.pkl"
-                if shap_remote.exists():
-                    with open(shap_remote, "rb") as f:
-                        data = pickle.load(f)
+            meta = get_db()["model_metadata"].find_one({"model_name": "aqi_champion"})
+            if meta and meta.get("artifacts_gridfs_id"):
+                zip_bytes = get_gridfs().get(meta["artifacts_gridfs_id"]).read()
+                with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                    if "shap_values.pkl" in zf.namelist():
+                        data = pickle.loads(zf.read("shap_values.pkl"))
         except Exception as e:
-            print(f"[inference] Could not load SHAP from Hopsworks: {e}")
+            print(f"[inference] Could not load SHAP from MongoDB: {e}")
 
     with _cache_lock:
         _SHAP_CACHE["data"] = data
@@ -462,13 +373,9 @@ def load_shap_data() -> dict:
 # ─── Leaderboard metadata ─────────────────────────────────────────────────────
 
 def load_all_models_metadata() -> list[dict]:
-    """Fetch metadata for all registered models (for the leaderboard).
+    """Fetch metrics for all registered models (for the leaderboard).
 
-    Results are cached for _METADATA_CACHE_TTL seconds so repeated tab
-    switches don't trigger a full Hopsworks login on every click.
-
-    NOTE: Hopsworks SDK 4.7 changed get_models() to require a 'name' argument.
-    We iterate over all known model names instead of calling get_models() bare.
+    Single MongoDB query — no per-model downloads, no KNOWN_MODEL_NAMES loop.
     """
     now = datetime.now(timezone.utc)
     with _cache_lock:
@@ -480,49 +387,38 @@ def load_all_models_metadata() -> list[dict]:
             print("[inference] Returning cached leaderboard metadata")
             return _METADATA_CACHE["data"]
 
-    # All names that the training pipeline ever registers
-    KNOWN_MODEL_NAMES = [
-        "aqi_champion",
-        "Ridge", "Lasso", "ElasticNet",
-        "RandomForest", "GradientBoosting",
-        "XGBoost", "CatBoost",
-        "LSTM", "distilled_student",
-    ]
     try:
-        with _hopsworks_lock:
-            project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
-            mr = project.get_model_registry()
-            results = []
-            for model_name in KNOWN_MODEL_NAMES:
-                try:
-                    models = mr.get_models(name=model_name)  # 4.7 requires name kwarg
-                    for m in (models or []):
-                        # Use training_metrics attribute directly — does NOT trigger a download.
-                        # Avoid m.download() here; that causes [Errno 5] when /tmp cert files
-                        # from a previous login session are stale or locked.
-                        tm = {}
-                        try:
-                            tm = m.training_metrics or {}
-                        except Exception:
-                            pass
-                        results.append({
-                            "name":        m.name,
-                            "version":     m.version,
-                            "rmse":        tm.get("rmse", None),
-                            "ioa":         tm.get("ioa",  None),
-                            "skill_score": tm.get("skill_score", None),
-                            "oof_rmse":    tm.get("oof_rmse", None),
-                            "overfit":     bool(tm.get("overfit_flag", 0)),
-                            "is_champion": m.name == "aqi_champion",
-                        })
-                except Exception:
-                    pass  # model name simply doesn't exist yet — skip silently
+        cursor = get_db()["model_metadata"].find(
+            {},
+            {"_id": 0, "artifacts_gridfs_id": 0},
+        )
+        results = []
+        for doc in cursor:
+            if doc.get("model_name") == "aqi_champion":
+                continue  # champion is shown via promoted_from in the originating model row
+            results.append({
+                "name":        doc.get("model_name"),
+                "version":     doc.get("trained_at", "-"),
+                "rmse":        doc.get("rmse"),
+                "ioa":         doc.get("ioa"),
+                "skill_score": doc.get("skill_score"),
+                "oof_rmse":    doc.get("oof_rmse"),
+                "topsis_score":doc.get("topsis_score"),
+                "overfit":     bool(doc.get("overfit_flag", 0)),
+                "is_champion": bool(doc.get("is_champion", False)),
+            })
 
-        data = results if results else [{"name": "No models registered yet", "version": "-", "status": "challenger"}]
+        # Mark the promoted_from model as champion
+        champ = get_db()["model_metadata"].find_one({"model_name": "aqi_champion"})
+        if champ and champ.get("promoted_from"):
+            for r in results:
+                if r["name"] == champ["promoted_from"]:
+                    r["is_champion"] = True
+
+        data = results or [{"name": "No models registered yet", "version": "-"}]
     except Exception as e:
         print(f"[inference] load_all_models_metadata failed: {e}")
-        # Do NOT cache — let the next tab click retry fresh
-        return [{"name": f"Hopsworks unavailable: {e}", "version": "-"}]
+        return [{"name": f"MongoDB unavailable: {e}", "version": "-"}]
 
     with _cache_lock:
         _METADATA_CACHE["data"] = data
@@ -533,12 +429,6 @@ def load_all_models_metadata() -> list[dict]:
 # ─── Background cache warm-up ─────────────────────────────────────────────────
 
 def _warm_cache():
-    """Pre-warm metadata + SHAP caches in the background.
-
-    Called once at module import time so the first tab click never
-    blocks on a cold Hopsworks request.  Errors are silently swallowed
-    because the cache functions have their own error handling.
-    """
     try:
         print("[inference] Background warm-up: loading leaderboard metadata...")
         load_all_models_metadata()
@@ -549,5 +439,4 @@ def _warm_cache():
         print(f"[inference] Background warm-up error (non-fatal): {e}")
 
 
-# Kick off warm-up in a daemon thread so it doesn't block gunicorn startup
 threading.Thread(target=_warm_cache, daemon=True, name="inference-warmup").start()

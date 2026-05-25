@@ -53,26 +53,29 @@ except Exception as e:
     print(f"{FAIL} OpenWeather exception: {e}")
     results.append(("OpenWeather", False))
 
-# ── 3. Hopsworks ──────────────────────────────────────────────────────────────
-print("\n── 3. Hopsworks Feature Store ───────────────────────────────────────")
+# ── 3. MongoDB Atlas ──────────────────────────────────────────────────────────
+print("\n── 3. MongoDB Atlas ─────────────────────────────────────────────────")
 try:
-    import hopsworks
-    project = hopsworks.login(
-        api_key_value=os.getenv("HOPSWORKS_API_KEY"),
-        project=os.getenv("HOPSWORKS_PROJECT", "aqi_predictor"),
-    )
-    fs = project.get_feature_store()
-    print(f"{PASS} Hopsworks connected — project: {project.name}")
-    results.append(("Hopsworks", True))
+    from pymongo import MongoClient
+    uri = os.getenv("MONGODB_URI")
+    if not uri:
+        raise ValueError("MONGODB_URI not set in .env")
+    client = MongoClient(uri, serverSelectionTimeoutMS=8_000)
+    db_name = os.getenv("MONGODB_DB_NAME", "aqi_db")
+    db = client[db_name]
+    collections = db.list_collection_names()
+    print(f"{PASS} MongoDB connected — db='{db_name}', collections: {collections or '(empty, ready for first run)'}")
+    results.append(("MongoDB", True))
 except Exception as e:
-    print(f"{FAIL} Hopsworks exception: {e}")
-    results.append(("Hopsworks", False))
+    print(f"{FAIL} MongoDB exception: {e}")
+    results.append(("MongoDB", False))
 
 # ── 4. Key Python packages ────────────────────────────────────────────────────
 print("\n── 4. Key Python Packages ───────────────────────────────────────────")
 packages = [
     ("pandas", "pd"),
     ("numpy", "np"),
+    ("pymongo", "pymongo"),
     ("sklearn", "sklearn"),
     ("xgboost", "xgb"),
     ("lightgbm", "lgb"),
@@ -136,7 +139,7 @@ for name, ok in results:
 
 if all_ok:
     print(f"\n{PASS} All checks passed — ready to run the backfill!")
-    print(f"{INFO} Next step: python src/backfill/backfill_features.py --strategy hybrid")
+    print(f"{INFO} Next step: MONGODB_URI=... python src/backfill/backfill_features.py")
 else:
     print(f"\n{FAIL} Some checks failed — fix the above before running the pipeline.")
 print()

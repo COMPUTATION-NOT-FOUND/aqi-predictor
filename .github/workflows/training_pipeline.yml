@@ -27,8 +27,8 @@ jobs:
         env:
           AQICN_API_KEY:       ${{ secrets.AQICN_API_KEY }}
           OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
-          HOPSWORKS_API_KEY:   ${{ secrets.HOPSWORKS_API_KEY }}
-          HOPSWORKS_PROJECT:   ${{ secrets.HOPSWORKS_PROJECT }}
+          MONGODB_URI:         ${{ secrets.MONGODB_URI }}
+          MONGODB_DB_NAME:     ${{ secrets.MONGODB_DB_NAME }}
           MLFLOW_TRACKING_URI: "mlruns"
         run: python src/backfill/ablation_backfill.py
 
@@ -36,8 +36,8 @@ jobs:
         env:
           AQICN_API_KEY:       ${{ secrets.AQICN_API_KEY }}
           OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
-          HOPSWORKS_API_KEY:   ${{ secrets.HOPSWORKS_API_KEY }}
-          HOPSWORKS_PROJECT:   ${{ secrets.HOPSWORKS_PROJECT }}
+          MONGODB_URI:         ${{ secrets.MONGODB_URI }}
+          MONGODB_DB_NAME:     ${{ secrets.MONGODB_DB_NAME }}
           MLFLOW_TRACKING_URI: "mlruns"
         run: python src/training_pipeline/train_model.py
 

@@ -5,7 +5,7 @@ Steps:
 1. Fetch raw data from AQICN + OpenWeather
 2. Build feature row (engineering + encoding)
 3. Apply pre-fit scaler (loaded from disk)
-4. Push to Hopsworks Feature Store
+4. Push to MongoDB Feature Store
 5. Run PSI drift check; trigger alert if needed
 """
 import pandas as pd
@@ -18,7 +18,7 @@ from src.feature_pipeline.fetch_data import fetch_current
 from src.feature_pipeline.feature_engineering import (
     build_feature_row, pm25_to_aqi, load_scaler, apply_scaler,
 )
-from src.feature_pipeline.store_features import insert_features, fetch_training_data
+from src.feature_pipeline.store_features import insert_features, fetch_recent
 from src.feature_pipeline.drift_monitor import check_drift
 
 
@@ -30,8 +30,7 @@ def run_pipeline(city: str = DEFAULT_CITY, lat: float = DEFAULT_LAT, lon: float 
 
     # 2. Fetch recent history for lag/rolling features (last 72 rows)
     try:
-        history = fetch_training_data()
-        history = history.tail(72)
+        history = fetch_recent(city, n=72)
     except Exception:
         history = pd.DataFrame()
 
@@ -57,7 +56,7 @@ def run_pipeline(city: str = DEFAULT_CITY, lat: float = DEFAULT_LAT, lon: float 
     else:
         print("[pipeline] No scaler found — storing raw (unscaled) features for now")
 
-    # 5. Push to Hopsworks
+    # 5. Push to MongoDB
     insert_features(df)
 
     # 6. Drift check

@@ -10,8 +10,8 @@ python-dotenv>=1.0.0
 pandas>=2.1.0
 numpy>=1.26.0
 
-# Feature store
-hopsworks[python]==4.7.*
+# Database
+pymongo[srv]>=4.6.0
 
 # Experiment tracking
 mlflow>=2.11.0

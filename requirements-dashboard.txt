@@ -13,13 +13,13 @@ python-dotenv>=1.0.0
 pandas>=2.1.0
 numpy>=1.26.0
 
-# Feature store
-hopsworks[python]==4.7.*
+# Database
+pymongo[srv]>=4.6.0
 
 # Experiment tracking (reads mlruns/ for ablation tab)
 mlflow>=2.11.0
 
-# ML — needed to unpickle champion models loaded from Hopsworks
+# ML — needed to unpickle champion models loaded from MongoDB GridFS
 scikit-learn>=1.4.0
 xgboost>=2.0.0
 catboost>=1.2.0

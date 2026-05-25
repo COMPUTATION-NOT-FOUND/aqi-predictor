@@ -43,7 +43,7 @@ _SPINNER = dbc.Spinner(
 
 _LOADING_DIV = html.Div(
     [_SPINNER,
-     html.P("Loading data from Hopsworks…",
+     html.P("Loading data…",
             style={"color": "#a6adc8", "marginTop": "16px", "fontSize": "0.9rem"})],
     style={"display": "flex", "flexDirection": "column",
            "alignItems": "center", "justifyContent": "center",
@@ -98,7 +98,7 @@ app.layout = dbc.Container(
 def render_tab_skeleton(active_tab, _):
     """Render the tab shell immediately with a loading spinner.
 
-    Each tab that requires Hopsworks data is split into:
+    Each tab that requires data is split into:
       1. This callback → returns the shell + dcc.Loading wrapper instantly
       2. A second callback (below) → fills in the real content asynchronously
     """
@@ -138,7 +138,7 @@ def render_tab_skeleton(active_tab, _):
     return html.Div("Unknown tab")
 
 
-# ─── Deferred content callbacks (these do the heavy Hopsworks work) ───────────
+# ─── Deferred content callbacks ───────────────────────────────────────────────
 
 @app.callback(
     Output("forecast-content", "children"),

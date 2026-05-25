@@ -2,7 +2,7 @@
 Main training pipeline — runs daily via GitHub Actions.
 
 Steps:
-1. Fetch historical features from Hopsworks Feature Store
+1. Fetch historical features from MongoDB
 2. Temporal train/val/test split (70/10/20)
 3. Fit + re-save RobustScaler on training data
 4. Train 12 classical + deep learning models with OOF + TimeSeriesSplit CV
@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore")
 
 import logging
 for _logger in ["mlflow", "mlflow.models.model", "mlflow.sklearn", "mlflow.utils",
-                "tensorflow", "absl", "hopsworks"]:
+                "tensorflow", "absl"]:
     logging.getLogger(_logger).setLevel(logging.ERROR)
 
 import numpy as np
@@ -59,7 +59,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # Re-apply after imports since mlflow resets its loggers on import
 for _logger in ["mlflow", "mlflow.models.model", "mlflow.sklearn", "mlflow.utils",
-                "mlflow.tensorflow", "tensorflow", "absl", "hopsworks"]:
+                "mlflow.tensorflow", "tensorflow", "absl"]:
     logging.getLogger(_logger).setLevel(logging.ERROR)
 
 TARGET_COLS  = [f"aqi_{h}h" for h in FORECAST_HOURS]

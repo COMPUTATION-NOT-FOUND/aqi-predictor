@@ -27,8 +27,8 @@ jobs:
         env:
           AQICN_API_KEY:       ${{ secrets.AQICN_API_KEY }}       # FILL IN: add to GitHub repo Secrets
           OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }} # FILL IN: add to GitHub repo Secrets
-          HOPSWORKS_API_KEY:   ${{ secrets.HOPSWORKS_API_KEY }}   # FILL IN: add to GitHub repo Secrets
-          HOPSWORKS_PROJECT:   ${{ secrets.HOPSWORKS_PROJECT }}
+          MONGODB_URI:         ${{ secrets.MONGODB_URI }}         # FILL IN: Atlas SRV connection string
+          MONGODB_DB_NAME:     ${{ secrets.MONGODB_DB_NAME }}
           DEFAULT_CITY:        "karachi"
           MLFLOW_TRACKING_URI: "mlruns"
         run: python src/feature_pipeline/pipeline.py

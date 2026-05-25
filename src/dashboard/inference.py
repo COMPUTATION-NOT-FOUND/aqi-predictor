@@ -160,7 +160,10 @@ def predict_3day(
     raw = {}
     try:
         raw = fetch_current(city=city, lat=lat, lon=lon)
-        current_aqi = pm25_to_aqi(raw.get("pm25", 0))
+        # Use AQICN's already-computed AQI directly; fall back to PM2.5 conversion
+        # only if the API didn't return one. pm25_to_aqi(pm25_from_openweather)
+        # causes a slight mismatch because OpenWeather and AQICN use different sensors.
+        current_aqi = float(raw.get("aqi_from_api") or 0) or pm25_to_aqi(raw.get("pm25", 0))
     except Exception as e:
         print(f"[inference] fetch_current failed: {e}")
         return {

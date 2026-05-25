@@ -94,7 +94,7 @@ class _FirstOutputWrapper(BaseEstimator):
 # ─── Data Preparation ─────────────────────────────────────────────────────────
 
 def load_and_split():
-    print("[train] Loading features from Hopsworks...")
+    print("[train] Loading features from MongoDB...")
     df = fetch_training_data()
     df = df.dropna(subset=TARGET_COLS)
 

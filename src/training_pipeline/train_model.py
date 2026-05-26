@@ -348,9 +348,12 @@ def build_ensembles(results: list[dict], X_train, Y_train, X_test, Y_test, y_per
     voter.fit(X_train, Y_train)
     test_preds = voter.predict(X_test).ravel()
     v_metrics  = evaluate_all(Y_test.ravel(), test_preds, y_persistence)
-    v_metrics["oof_rmse"] = v_metrics["rmse"]
+    v_metrics["oof_rmse"] = _oof_rmse(voter, X_train, Y_train)
+    train_preds_v = voter.predict(X_train).ravel()
+    v_metrics["train_rmse"]  = float(np.sqrt(mean_squared_error(Y_train.ravel(), train_preds_v)))
+    v_metrics["overfit_flag"] = int(overfitting_flag(v_metrics["train_rmse"], v_metrics["rmse"]))
     ensemble_results = [{"name": "VotingEnsemble", "model": voter, "metrics": v_metrics}]
-    print(f"[train] VotingEnsemble: RMSE={v_metrics['rmse']:.2f} | IoA={v_metrics.get('ioa', 0):.3f}")
+    print(f"[train] VotingEnsemble: RMSE={v_metrics['rmse']:.2f} | OOF={v_metrics['oof_rmse']:.2f} | IoA={v_metrics.get('ioa', 0):.3f}")
 
     # Stacking ensemble — MultiOutputRegressor wrapping a Ridge-meta stacker
     try:
@@ -367,9 +370,12 @@ def build_ensembles(results: list[dict], X_train, Y_train, X_test, Y_test, y_per
         stacker.fit(X_train, Y_train)
         stack_preds = stacker.predict(X_test).ravel()
         st_metrics  = evaluate_all(Y_test.ravel(), stack_preds, y_persistence)
-        st_metrics["oof_rmse"] = st_metrics["rmse"]
+        st_metrics["oof_rmse"] = _oof_rmse(stacker, X_train, Y_train)
+        train_preds_s = stacker.predict(X_train).ravel()
+        st_metrics["train_rmse"]  = float(np.sqrt(mean_squared_error(Y_train.ravel(), train_preds_s)))
+        st_metrics["overfit_flag"] = int(overfitting_flag(st_metrics["train_rmse"], st_metrics["rmse"]))
         ensemble_results.append({"name": "StackingEnsemble", "model": stacker, "metrics": st_metrics})
-        print(f"[train] StackingEnsemble: RMSE={st_metrics['rmse']:.2f} | IoA={st_metrics.get('ioa', 0):.3f}")
+        print(f"[train] StackingEnsemble: RMSE={st_metrics['rmse']:.2f} | OOF={st_metrics['oof_rmse']:.2f} | IoA={st_metrics.get('ioa', 0):.3f}")
     except Exception as e:
         print(f"[train] StackingEnsemble skipped: {e}")
 

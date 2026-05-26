@@ -49,7 +49,7 @@ _FEATURES_CACHE_TTL = 300              # 5 minutes
 
 # Leaderboard metadata: changes only after daily training run.
 _METADATA_CACHE: dict = {"data": None, "ts": None}
-_METADATA_CACHE_TTL = 1800             # 30 minutes
+_METADATA_CACHE_TTL = 300              # 5 minutes — match the dashboard refresh interval
 
 # SHAP values: changes only after daily training run.
 _SHAP_CACHE: dict = {"data": None, "ts": None}

@@ -197,6 +197,14 @@ def build_hindcast_chart(
         "OOF = out-of-fold (held-out) — leakage-free · "
         "IoA: Willmott (1981) · Skill: Murphy (1988) 1 − RMSE_model/RMSE_persistence",
     ))
+    if has_oof:
+        all_vals = pd.concat([
+            obs.dropna() if obs is not None else pd.Series(dtype=float),
+            pred.dropna() if pred is not None else pd.Series(dtype=float),
+        ])
+        if not all_vals.empty:
+            y_max = float(np.nanpercentile(all_vals, 95)) * 1.3
+            fig.update_layout(yaxis=dict(range=[0, min(500, max(y_max, 50))]))
     return fig
 
 

@@ -294,15 +294,15 @@ def train_lstm(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence) ->
         )
         model.fit(
             Xtr_s, Ytr_s, validation_data=(Xvl_s, Yvl_s),
-            epochs=20, batch_size=64, verbose=0,
-            callbacks=[EarlyStopping(patience=3, restore_best_weights=True)],
+            epochs=50, batch_size=64, verbose=0,
+            callbacks=[EarlyStopping(patience=7, restore_best_weights=True)],
         )
         preds = model.predict(Xvl_s, verbose=0).ravel()
         return float(np.sqrt(mean_squared_error(Yvl_s.ravel(), preds)))
 
     with mlflow.start_run(run_name="LSTM"):
         study = optuna.create_study(direction="minimize")
-        study.optimize(objective, n_trials=5, show_progress_bar=False)
+        study.optimize(objective, n_trials=15, show_progress_bar=False)
         best = study.best_params
         seq_len = best["sequence_length"]
 
@@ -313,8 +313,8 @@ def train_lstm(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence) ->
         Xte_s, Yte_s = to_seq(X_test,  Y_test,  seq_len)
         final_model   = build_lstm(**best, n_features=X_train.shape[1], n_outputs=n_outputs)
         final_model.fit(
-            Xtr_s, Ytr_s, epochs=50, batch_size=64, verbose=0,
-            callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
+            Xtr_s, Ytr_s, epochs=100, batch_size=64, verbose=0,
+            callbacks=[EarlyStopping(patience=20, restore_best_weights=True)],
         )
         test_preds  = final_model.predict(Xte_s, verbose=0).ravel()
         train_preds = final_model.predict(Xtr_s, verbose=0).ravel()

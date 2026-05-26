@@ -70,38 +70,41 @@ CLASSICAL_MODELS = [
 
 def xgb_suggest(trial: optuna.Trial) -> dict:
     return {
-        "n_estimators":     trial.suggest_int("n_estimators", 100, 300),
-        "max_depth":        trial.suggest_int("max_depth", 3, 9),
+        "n_estimators":     trial.suggest_int("n_estimators", 200, 800),
+        "max_depth":        trial.suggest_int("max_depth", 3, 10),
         "learning_rate":    trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
         "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
         "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
         "reg_alpha":        trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
         "reg_lambda":       trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
         "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+        "gamma":            trial.suggest_float("gamma", 0.0, 5.0),
     }
 
 
 
 def cat_suggest(trial: optuna.Trial) -> dict:
     return {
-        "iterations":     trial.suggest_int("iterations", 100, 300),
-        "depth":          trial.suggest_int("depth", 3, 9),
-        "learning_rate":  trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
-        "l2_leaf_reg":    trial.suggest_float("l2_leaf_reg", 1e-8, 10.0, log=True),
+        "iterations":          trial.suggest_int("iterations", 200, 800),
+        "depth":               trial.suggest_int("depth", 3, 10),
+        "learning_rate":       trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+        "l2_leaf_reg":         trial.suggest_float("l2_leaf_reg", 1e-8, 10.0, log=True),
         "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 1.0),
+        "min_data_in_leaf":    trial.suggest_int("min_data_in_leaf", 1, 50),
     }
 
 
 def lgbm_suggest(trial: optuna.Trial) -> dict:
     return {
-        "n_estimators":       trial.suggest_int("n_estimators", 100, 400),
-        "max_depth":          trial.suggest_int("max_depth", 3, 9),
-        "learning_rate":      trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
-        "subsample":          trial.suggest_float("subsample", 0.5, 1.0),
-        "colsample_bytree":   trial.suggest_float("colsample_bytree", 0.4, 1.0),
-        "reg_alpha":          trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-        "reg_lambda":         trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
-        "min_child_samples":  trial.suggest_int("min_child_samples", 5, 50),
+        "n_estimators":      trial.suggest_int("n_estimators", 200, 1000),
+        "num_leaves":        trial.suggest_int("num_leaves", 20, 300),
+        "max_depth":         trial.suggest_int("max_depth", -1, 12),
+        "learning_rate":     trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+        "subsample":         trial.suggest_float("subsample", 0.5, 1.0),
+        "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.4, 1.0),
+        "reg_alpha":         trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+        "reg_lambda":        trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+        "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
     }
 
 
@@ -113,7 +116,7 @@ OPTUNA_MODELS = [
             verbosity=0, **params,
         ), n_jobs=1),
         "suggest": xgb_suggest,
-        "n_trials": 20,
+        "n_trials": 50,
     },
     {
         "name":    "CatBoost",
@@ -122,7 +125,7 @@ OPTUNA_MODELS = [
             verbose=0, **params,
         ), n_jobs=1),
         "suggest": cat_suggest,
-        "n_trials": 15,
+        "n_trials": 35,
     },
     {
         "name":    "LightGBM",
@@ -131,7 +134,7 @@ OPTUNA_MODELS = [
             verbosity=-1, **params,
         ), n_jobs=1),
         "suggest": lgbm_suggest,
-        "n_trials": 20,
+        "n_trials": 50,
     },
 ]
 
@@ -159,7 +162,7 @@ def build_lstm(units=64, dropout=0.2, learning_rate=1e-3, sequence_length=24, n_
 
 def lstm_suggest(trial: optuna.Trial) -> dict:
     return {
-        "units":           trial.suggest_categorical("units", [32, 64, 128]),
+        "units":           trial.suggest_categorical("units", [64, 128, 256]),
         "dropout":         trial.suggest_float("dropout", 0.1, 0.5),
         "learning_rate":   trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
         "sequence_length": trial.suggest_categorical("sequence_length", [24, 48, 72]),

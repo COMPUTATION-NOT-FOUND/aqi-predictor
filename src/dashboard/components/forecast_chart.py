@@ -139,25 +139,27 @@ def build_hindcast_chart(
     fig = go.Figure()
     _add_aqi_zone_bands(fig)
 
-    has_obs  = (history_df is not None and not history_df.empty
-                and "aqi" in history_df.columns)
-    has_oof  = (oof_df is not None and not oof_df.empty)
-
-    if has_obs:
-        hist = history_df.tail(168).copy()
-        ts   = pd.to_datetime(hist.get("timestamp", pd.Series()), utc=True, errors="coerce")
-        aqi  = pd.to_numeric(hist["aqi"], errors="coerce")
-        fig.add_trace(go.Scatter(
-            x=ts, y=aqi, mode="lines",
-            name="Observed (ground truth)",
-            line=dict(color="#89b4fa", width=2),
-            hovertemplate="%{y:.0f}<extra>Observed</extra>",
-        ))
+    has_oof = (oof_df is not None and not oof_df.empty)
 
     if has_oof:
         oof = oof_df.copy()
-        ts_oof  = pd.to_datetime(oof.get("timestamp", pd.Series()), utc=True, errors="coerce")
-        pred    = pd.to_numeric(oof.get("predicted", oof.get("aqi_pred", None)), errors="coerce")
+        oof["timestamp"] = pd.to_datetime(
+            oof.get("timestamp", pd.Series()), utc=True, errors="coerce"
+        )
+        oof = oof.sort_values("timestamp")
+
+        ts_oof = oof["timestamp"]
+        obs    = pd.to_numeric(oof.get("observed", oof.get("aqi", None)), errors="coerce")
+        pred   = pd.to_numeric(oof.get("predicted", oof.get("aqi_pred", None)), errors="coerce")
+
+        if obs is not None:
+            fig.add_trace(go.Scatter(
+                x=ts_oof, y=obs, mode="lines",
+                name="Observed (ground truth)",
+                line=dict(color="#89b4fa", width=2),
+                hovertemplate="%{y:.0f}<extra>Observed</extra>",
+            ))
+
         if pred is not None:
             fig.add_trace(go.Scatter(
                 x=ts_oof, y=pred, mode="lines+markers",
@@ -167,19 +169,14 @@ def build_hindcast_chart(
                 hovertemplate="%{y:.0f}<extra>OOF Predicted</extra>",
             ))
 
-            # Compute metrics for annotation
-            obs_aligned = pd.to_numeric(
-                oof.get("observed", oof.get("aqi", None)), errors="coerce"
-            )
-            if obs_aligned is not None:
-                mask = obs_aligned.notna() & pred.notna()
+            if obs is not None:
+                mask = obs.notna() & pred.notna()
                 if mask.sum() > 2:
                     from src.training_pipeline.evaluate_model import (
                         rmse as _rmse, index_of_agreement, skill_score as _ss
                     )
-                    y_true = obs_aligned[mask].values
+                    y_true = obs[mask].values
                     y_pred = pred[mask].values
-                    # Persistence baseline = shift by 24 samples (≈1 day at hourly cadence)
                     y_pers = np.roll(y_true, 24)
 
                     val_rmse  = _rmse(y_true, y_pred)
@@ -188,7 +185,7 @@ def build_hindcast_chart(
 
                     _add_metric_annotation(fig, val_rmse, val_ioa, val_skill)
 
-    if not has_obs and not has_oof:
+    if not has_oof:
         fig.add_annotation(
             text="Run the training pipeline first to populate OOF predictions",
             xref="paper", yref="paper", x=0.5, y=0.5,

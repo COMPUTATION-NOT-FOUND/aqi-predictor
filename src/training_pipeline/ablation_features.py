@@ -2,11 +2,13 @@
 Feature group ablation study — self-maintained, runs nightly as part of training pipeline.
 
 For each feature group in FEATURE_GROUPS, temporarily disable it, train a fixed RF,
-log the RMSE delta to MLflow. Results auto-populate the dashboard's Ablation tab.
+log the RMSE delta to MLflow and persist results to MongoDB so the dashboard's
+Ablation tab works on Render (where the local mlruns/ dir is ephemeral).
 """
 import mlflow
 import numpy as np
 import pandas as pd
+from datetime import datetime, timezone
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error
@@ -98,4 +100,27 @@ def run_ablation(df: pd.DataFrame):
         results[group] = delta
         print(f"[ablation_features] drop '{group}': RMSE={group_rmse:.2f} (Δ={delta:+.2f})")
 
+    _persist_to_mongodb(baseline_rmse, results)
     return results  # {group: delta} — negative delta means group is hurting performance
+
+
+def _persist_to_mongodb(baseline_rmse: float, group_deltas: dict):
+    """Upsert ablation results into MongoDB so the dashboard works on Render."""
+    try:
+        from src.db import get_db
+        groups = [
+            {"group": g, "rmse_delta": d, "rmse": baseline_rmse + d}
+            for g, d in group_deltas.items()
+        ]
+        get_db()["ablation_results"].update_one(
+            {"_id": "feature_ablation"},
+            {"$set": {
+                "baseline_rmse": baseline_rmse,
+                "groups": groups,
+                "run_at": datetime.now(timezone.utc).isoformat(),
+            }},
+            upsert=True,
+        )
+        print(f"[ablation_features] Results persisted to MongoDB ({len(groups)} groups)")
+    except Exception as e:
+        print(f"[ablation_features] MongoDB persist failed (non-fatal): {e}")

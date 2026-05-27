@@ -2,14 +2,15 @@
 Backfill strategy ablation study.
 
 For each of the 5 imputation strategies, backfill the same date range,
-train a fixed Random Forest, record RMSE, and log results to MLflow.
-Results are read by the dashboard's Ablation tab.
+train a fixed Random Forest, record RMSE, log to MLflow, and persist results
+to MongoDB so the dashboard's Ablation tab works on Render (ephemeral filesystem).
 
 Runs automatically as part of the daily training pipeline.
 """
 import mlflow
 import numpy as np
 import pandas as pd
+from datetime import datetime, timezone
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
@@ -74,7 +75,29 @@ def run_ablation():
     best = min(results, key=results.get) if results else "hybrid"
     print(f"\n[ablation_backfill] Best strategy: {best} (RMSE={results.get(best, '?'):.2f})")
     print(f"[ablation_backfill] All results: {results}")
+    _persist_to_mongodb(results)
     return results
+
+
+def _persist_to_mongodb(strategy_rmses: dict):
+    """Upsert backfill ablation results into MongoDB so the dashboard works on Render."""
+    try:
+        from src.db import get_db
+        strategies = [
+            {"strategy": s, "rmse": r}
+            for s, r in strategy_rmses.items()
+        ]
+        get_db()["ablation_results"].update_one(
+            {"_id": "backfill_ablation"},
+            {"$set": {
+                "strategies": strategies,
+                "run_at": datetime.now(timezone.utc).isoformat(),
+            }},
+            upsert=True,
+        )
+        print(f"[ablation_backfill] Results persisted to MongoDB ({len(strategies)} strategies)")
+    except Exception as e:
+        print(f"[ablation_backfill] MongoDB persist failed (non-fatal): {e}")
 
 
 if __name__ == "__main__":

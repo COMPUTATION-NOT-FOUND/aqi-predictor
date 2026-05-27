@@ -121,7 +121,7 @@ def render_tab_skeleton(active_tab, _):
             ),
         ])
     elif active_tab == "tab-ablation":
-        # Ablation reads only MLflow (local files) — no loading state needed
+        # Ablation reads MLflow — fast/synchronous, no loading state needed
         return _render_ablation()
     elif active_tab == "tab-shap":
         return html.Div([
@@ -133,7 +133,7 @@ def render_tab_skeleton(active_tab, _):
             ),
         ])
     elif active_tab == "tab-drift":
-        # Drift reads local log file — fast, no loading state needed
+        # Drift reads MongoDB drift_log — fast, no loading state needed
         return _render_drift()
     return html.Div("Unknown tab")
 

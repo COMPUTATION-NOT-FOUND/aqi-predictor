@@ -44,10 +44,22 @@ FEATURE_GROUPS = {
     "meteorology":     True,   # temperature, humidity, wind_speed, pressure, etc.
 }
 
-# Apply any persisted ablation overrides (written by training pipeline)
-if _OVERRIDE_PATH.exists():
-    with open(_OVERRIDE_PATH) as _f:
-        FEATURE_GROUPS.update(json.load(_f))
+# Apply persisted ablation overrides — MongoDB is the source of truth so the
+# selection survives across GitHub Actions runs.  Fall back to the local JSON
+# file for offline development when MONGODB_URI is not set.
+def _load_feature_overrides() -> dict:
+    try:
+        from src.db import get_db
+        doc = get_db()["feature_overrides"].find_one({"_id": "current"}) or {}
+        return {k: v for k, v in doc.items() if k not in ("_id", "updated_at")}
+    except Exception:
+        pass
+    if _OVERRIDE_PATH.exists():
+        with open(_OVERRIDE_PATH) as _f:
+            return json.load(_f)
+    return {}
+
+FEATURE_GROUPS.update(_load_feature_overrides())
 
 # ─── Drift Thresholds ─────────────────────────────────────────────────────────
 PSI_WARN_THRESHOLD  = 0.1   # moderate drift

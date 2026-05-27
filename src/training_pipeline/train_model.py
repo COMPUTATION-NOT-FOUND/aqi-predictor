@@ -406,13 +406,13 @@ ABLATION_REENABLE_THRESHOLD = 0.0   # re-enable a group if it's no longer harmfu
 _OVERRIDE_PATH = Path(__file__).parent.parent.parent / "feature_groups_override.json"
 
 def _persist_ablation_overrides(deltas: dict):
-    import json
     from src.config import FEATURE_GROUPS
+    from src.db import get_db
 
-    overrides = {}
-    if _OVERRIDE_PATH.exists():
-        with open(_OVERRIDE_PATH) as f:
-            overrides = json.load(f)
+    # Load current overrides from MongoDB
+    db = get_db()
+    doc = db["feature_overrides"].find_one({"_id": "current"}) or {}
+    overrides = {k: v for k, v in doc.items() if k != "_id"}
 
     changed = []
     for group, delta in deltas.items():
@@ -423,8 +423,11 @@ def _persist_ablation_overrides(deltas: dict):
             overrides[group] = True
             changed.append(f"re-enabled '{group}' (Δ={delta:+.2f})")
 
-    with open(_OVERRIDE_PATH, "w") as f:
-        json.dump(overrides, f, indent=2)
+    db["feature_overrides"].update_one(
+        {"_id": "current"},
+        {"$set": {**overrides, "updated_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
 
     if changed:
         print(f"[ablation] Feature groups updated for next run: {', '.join(changed)}")

@@ -14,6 +14,7 @@ from sklearn.metrics import mean_squared_error
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from src.config import MLFLOW_TRACKING_URI, FEATURE_GROUPS, FORECAST_HOURS
+from src.feature_pipeline.feature_engineering import FEATURE_GROUP_COLS
 
 EXPERIMENT_NAME = "feature_ablation"
 TARGET_COL      = "aqi_24h"
@@ -31,21 +32,8 @@ def _cv_rmse(X: np.ndarray, y: np.ndarray) -> float:
 
 
 def _feature_cols_for_group(group: str, all_cols: list[str]) -> list[str]:
-    """Return column names that belong to a given feature group."""
-    mapping = {
-        "time_basic":      ["hour", "month", "season", "is_weekend"] + [f"dow_{i}" for i in range(7)],
-        "time_fourier":    ["hour_sin", "hour_cos", "month_sin", "month_cos"],
-        "lag_features":    [c for c in all_cols if "lag" in c],
-        "rolling_stats":   ["rolling_mean_3h", "rolling_mean_6h", "rolling_mean_24h", "rolling_std_24h"],
-        "physics_derived": ["wind_dir_sin", "wind_dir_cos", "mixing_height_proxy",
-                            "wind_transport_effect", "temp_humidity_interaction", "pm_ratio"],
-        "cross_feature":   ["pressure_anomaly", "aqi_change_rate"],
-        "stl_decomp":      ["aqi_trend", "aqi_seasonal", "aqi_residual"],
-        "raw_pollutants":  ["pm25", "pm10", "o3", "no2", "so2", "co"],
-        "meteorology":     ["temperature", "humidity", "pressure", "wind_speed",
-                            "visibility", "cloud_cover", "precipitation_1h"],
-    }
-    return [c for c in mapping.get(group, []) if c in all_cols]
+    """Return column names that belong to a given feature group (present in all_cols)."""
+    return [c for c in FEATURE_GROUP_COLS.get(group, []) if c in all_cols]
 
 
 def run_ablation(df: pd.DataFrame):

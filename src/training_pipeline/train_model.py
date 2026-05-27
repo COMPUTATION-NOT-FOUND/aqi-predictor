@@ -42,7 +42,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from src.config import MLFLOW_TRACKING_URI, FORECAST_HOURS
 from src.feature_pipeline.store_features import fetch_training_data
-from src.feature_pipeline.feature_engineering import fit_scaler, apply_scaler
+from src.feature_pipeline.feature_engineering import fit_scaler, apply_scaler, FEATURE_GROUP_COLS
 from src.feature_pipeline.drift_monitor import save_baseline
 from src.training_pipeline.models import (
     CLASSICAL_MODELS, OPTUNA_MODELS, build_lstm, lstm_suggest,
@@ -93,8 +93,21 @@ def load_and_split():
     df = fetch_training_data()
     df = df.dropna(subset=TARGET_COLS)
 
+    from src.config import FEATURE_GROUPS
     drop_meta = ["timestamp", "city"] + TARGET_COLS
-    feature_cols = sorted(c for c in df.columns if c not in drop_meta and df[c].dtype != object)
+
+    # Exclude columns that belong to currently-disabled feature groups so the
+    # model's feature set stays consistent with what build_feature_row produces
+    # at inference time (which also respects FEATURE_GROUPS).
+    disabled_cols: set[str] = set()
+    for group, enabled in FEATURE_GROUPS.items():
+        if not enabled:
+            disabled_cols.update(FEATURE_GROUP_COLS.get(group, []))
+
+    feature_cols = sorted(
+        c for c in df.columns
+        if c not in drop_meta and df[c].dtype != object and c not in disabled_cols
+    )
 
     n = len(df)
     n_train = int(n * 0.70)

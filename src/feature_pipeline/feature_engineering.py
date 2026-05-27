@@ -229,6 +229,26 @@ LOG_COLS    = ["pm25", "pm10"] + [f"pm25_lag_{h}h" for h in [1, 3, 6, 12, 24]]
 TARGET_COLS = [f"aqi_{h}h" for h in FORECAST_HOURS]
 SKIP_COLS   = TARGET_COLS + ["timestamp", "city"]
 
+# Authoritative mapping from feature group name → column names produced by build_feature_row.
+# Used by the training pipeline (to drop disabled groups from X) and the ablation study
+# (to test each group's impact).  Keep in sync with build_feature_row above.
+FEATURE_GROUP_COLS: dict[str, list[str]] = {
+    "raw_pollutants":  ["pm25", "pm10", "o3", "no2", "so2", "co"],
+    "meteorology":     ["temperature", "humidity", "pressure", "wind_speed",
+                        "visibility", "cloud_cover", "precipitation_1h"],
+    "time_basic":      ["hour", "month", "season", "is_weekend"] + [f"dow_{i}" for i in range(7)],
+    "time_fourier":    ["hour_sin", "hour_cos", "month_sin", "month_cos"],
+    "physics_derived": ["wind_dir_sin", "wind_dir_cos", "mixing_height_proxy",
+                        "wind_transport_effect", "temp_humidity_interaction", "pm_ratio"],
+    "cross_feature":   ["pressure_anomaly", "aqi_change_rate"],
+    "lag_features":    [f"aqi_lag_{h}h" for h in [1, 3, 6, 12, 24, 48, 72, 168]]
+                       + [f"pm25_lag_{h}h" for h in [1, 3, 6, 12, 24]],
+    "rolling_stats":   ["rolling_mean_3h", "rolling_mean_6h", "rolling_mean_24h",
+                        "rolling_std_24h", "rolling_min_24h", "rolling_max_24h",
+                        "aqi_pct_change_24h"],
+    "stl_decomp":      ["aqi_trend", "aqi_seasonal", "aqi_residual"],
+}
+
 
 def _log_transform(df: pd.DataFrame) -> pd.DataFrame:
     for col in LOG_COLS:

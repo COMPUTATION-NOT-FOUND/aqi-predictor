@@ -4,9 +4,8 @@ Main feature pipeline entry point — runs every hour via GitHub Actions.
 Steps:
 1. Fetch raw data from AQICN + OpenWeather
 2. Build feature row (engineering + encoding)
-3. Apply pre-fit scaler (loaded from disk)
-4. Push to MongoDB Feature Store
-5. Run PSI drift check; trigger alert if needed
+3. Push raw (unscaled) features to MongoDB Feature Store
+4. Run PSI drift check; trigger alert if needed
 """
 import pandas as pd
 from datetime import datetime, timezone
@@ -16,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from src.config import DEFAULT_CITY, DEFAULT_LAT, DEFAULT_LON
 from src.feature_pipeline.fetch_data import fetch_current
 from src.feature_pipeline.feature_engineering import (
-    build_feature_row, pm25_to_aqi, load_scaler, apply_scaler,
+    build_feature_row, pm25_to_aqi,
 )
 from src.feature_pipeline.store_features import insert_features, fetch_recent
 from src.feature_pipeline.drift_monitor import check_drift
@@ -34,13 +33,9 @@ def run_pipeline(city: str = DEFAULT_CITY, lat: float = DEFAULT_LAT, lon: float 
     except Exception:
         history = pd.DataFrame()
 
-    # 3. Build feature row
+    # 3. Build feature row (includes aqi via build_feature_row → pm25_to_aqi / aqi_from_api)
     ts  = datetime.now(timezone.utc)
     row = build_feature_row(raw, history, ts)
-    # Use AQICN's correctly computed AQI directly — do NOT re-convert PM2.5
-    # (pm25 from OpenWeather and AQICN sub-index are not the same unit)
-    row["aqi"] = int(raw["aqi_from_api"]) if raw.get("aqi_from_api", 0) > 0 else pm25_to_aqi(raw.get("pm25", 0))
-
 
     df = pd.DataFrame([row])
 
@@ -49,17 +44,14 @@ def run_pipeline(city: str = DEFAULT_CITY, lat: float = DEFAULT_LAT, lon: float 
         if col not in df.columns:
             df[col] = float("nan")
 
-    # 4. Apply pre-fit scaler (if available)
-    scaler = load_scaler()
-    if scaler is not None:
-        df = apply_scaler(df, scaler)
-    else:
-        print("[pipeline] No scaler found — storing raw (unscaled) features for now")
-
-    # 5. Push to MongoDB
+    # 4. Push raw (unscaled) features to MongoDB.
+    # Scaling is applied at training time (fit on raw training data) and at
+    # inference time (apply_scaler in inference.py).  Storing raw values here
+    # keeps the two paths consistent and prevents the scaler from being
+    # re-fit on already-scaled data during daily training runs.
     insert_features(df)
 
-    # 6. Drift check
+    # 5. Drift check
     _, alert = check_drift(df)
     if alert:
         print("[pipeline] DRIFT ALERT — check email / GitHub Actions notification")

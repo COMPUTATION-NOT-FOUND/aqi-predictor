@@ -32,6 +32,7 @@ from src.feature_pipeline.feature_engineering import load_scaler, apply_scaler, 
 from src.feature_pipeline.fetch_data import fetch_current
 from src.feature_pipeline.feature_engineering import build_feature_row
 from src.training_pipeline.conformal import load_calibrator, predict_with_intervals
+from src.training_pipeline.wrappers import FirstOutputWrapper  # noqa: F401 — needed for conformal calibrator unpickling
 
 SHAP_PATH = Path(__file__).parent.parent.parent / "shap_values.pkl"
 
@@ -254,7 +255,7 @@ def predict_3day(
         }
 
     try:
-        history = get_recent_features(city=city)
+        history = get_recent_features(city=city, n=72)
     except Exception as e:
         print(f"[inference] get_recent_features failed: {e}")
         history = pd.DataFrame()
@@ -286,8 +287,11 @@ def predict_3day(
             df_row = apply_scaler(df_row, scaler)
 
         drop_cols = ["timestamp", "city", "aqi_24h", "aqi_48h", "aqi_72h"]
-        feat_cols = [c for c in df_row.columns if c not in drop_cols and df_row[c].dtype != object]
+        # Sort alphabetically — MongoDB returns training columns in alphabetical order,
+        # so the stored model's feature positions are alphabetically indexed.
+        feat_cols = sorted(c for c in df_row.columns if c not in drop_cols and df_row[c].dtype != object)
         X = df_row[feat_cols].values
+        X = np.where(np.isfinite(X), X, 0.0)
 
         try:
             import tensorflow as tf

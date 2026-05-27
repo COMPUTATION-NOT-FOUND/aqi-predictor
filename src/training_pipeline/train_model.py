@@ -32,7 +32,6 @@ import shap
 import pickle
 from pathlib import Path
 from datetime import datetime, timezone
-from sklearn.base import BaseEstimator
 from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import StackingRegressor, VotingRegressor
@@ -54,6 +53,7 @@ from src.training_pipeline.distillation import distill
 from src.training_pipeline.conformal import calibrate
 from src.training_pipeline.ablation_features import run_ablation
 from src.training_pipeline.register_model import register_all
+from src.training_pipeline.wrappers import FirstOutputWrapper as _FirstOutputWrapper
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -85,11 +85,6 @@ class KerasWrapper:
     def predict(self, X): return self.model.predict(X, verbose=0)
 
 
-class _FirstOutputWrapper(BaseEstimator):
-    def __init__(self, model): self.model = model
-    def fit(self, X, y): return self
-    def predict(self, X): return self.model.predict(X)[:, 0]
-
 
 # ─── Data Preparation ─────────────────────────────────────────────────────────
 
@@ -99,23 +94,31 @@ def load_and_split():
     df = df.dropna(subset=TARGET_COLS)
 
     drop_meta = ["timestamp", "city"] + TARGET_COLS
-    feature_cols = [c for c in df.columns if c not in drop_meta and df[c].dtype != object]
+    feature_cols = sorted(c for c in df.columns if c not in drop_meta and df[c].dtype != object)
 
-    X = df[feature_cols].values.astype(np.float64)
-    # Sanitize: replace inf/-inf/NaN with 0 (can come from pm_ratio or pct_change on zero)
-    X = np.where(np.isfinite(X), X, 0.0)
-    Y = df[TARGET_COLS].values       # shape (n, 3)
-
-    n = len(X)
+    n = len(df)
     n_train = int(n * 0.70)
     n_val   = int(n * 0.10)
 
-    X_train, Y_train = X[:n_train],          Y[:n_train]
-    X_val,   Y_val   = X[n_train:n_train+n_val], Y[n_train:n_train+n_val]
-    X_test,  Y_test  = X[n_train+n_val:],    Y[n_train+n_val:]
+    # Fit scaler on raw training data only — no leakage into val/test
+    df_raw_train = df.iloc[:n_train].copy()  # kept raw for drift baseline
+    scaler = fit_scaler(df_raw_train)
+    print("[train] Scaler fitted on raw training data")
+
+    # Scale the full dataset; TARGET_COLS and timestamp/city are in SKIP_COLS
+    # so they are left in raw AQI units throughout
+    df = apply_scaler(df, scaler)
+
+    X = df[feature_cols].values.astype(np.float64)
+    X = np.where(np.isfinite(X), X, 0.0)
+    Y = df[TARGET_COLS].values       # shape (n, 3) — raw AQI units
+
+    X_train, Y_train = X[:n_train],               Y[:n_train]
+    X_val,   Y_val   = X[n_train:n_train+n_val],  Y[n_train:n_train+n_val]
+    X_test,  Y_test  = X[n_train+n_val:],         Y[n_train+n_val:]
 
     print(f"[train] Data split: train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
-    return X_train, Y_train, X_val, Y_val, X_test, Y_test, feature_cols, df
+    return X_train, Y_train, X_val, Y_val, X_test, Y_test, feature_cols, df, df_raw_train
 
 
 def persistence_baseline(Y_train, Y_test, n_ahead: int = 0) -> np.ndarray:
@@ -171,7 +174,7 @@ def _save_champion_oof_predictions(model, X_train, Y_train, df_train) -> None:
         print(f"[train] Saved {len(docs)} OOF prediction rows to MongoDB")
 
 
-def train_classical(X_train, Y_train, X_test, Y_test, y_persistence, scaler) -> list[dict]:
+def train_classical(X_train, Y_train, X_test, Y_test, y_persistence) -> list[dict]:
     results = []
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment("aqi_model_training")
@@ -436,38 +439,38 @@ def main():
     print(f"[train] Starting training pipeline at {datetime.now(timezone.utc).isoformat()}")
     print(f"{'='*60}\n")
 
-    # 1. Load data
-    X_train, Y_train, X_val, Y_val, X_test, Y_test, feature_cols, df = load_and_split()
+    # 1. Load data — scaler is fit inside load_and_split on raw training data
+    X_train, Y_train, X_val, Y_val, X_test, Y_test, feature_cols, df, df_raw_train = load_and_split()
 
-    # 2. Fit scaler on training data (saves scaler_bundle.pkl)
-    df_train = df.iloc[:len(X_train)]
-    fit_scaler(df_train)
-    print("[train] Scaler fitted and saved")
+    # 2. Save drift baseline from RAW (unscaled) training distribution so it
+    # matches the unscaled rows written by the hourly feature pipeline.
+    save_baseline(df_raw_train)
 
-    # 3. Apply scaler
-    from src.feature_pipeline.feature_engineering import load_scaler, apply_scaler
-    scaler = load_scaler()
-
-    # 4. Save drift baseline from training distribution
-    save_baseline(df_train)
-
-    # 5. Persistence baseline
+    # 3. Persistence baseline
     y_pers = persistence_baseline(Y_train, Y_test)
 
-    # 6. Train all models
-    classical_results = train_classical(X_train, Y_train, X_test, Y_test, y_pers, scaler)
+    # 4. Train all models
+    classical_results = train_classical(X_train, Y_train, X_test, Y_test, y_pers)
     optuna_results    = train_optuna(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_pers)
     lstm_result       = train_lstm(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_pers)
     all_results       = classical_results + optuna_results + [lstm_result]
 
-    # 7. Ensembles (exclude LSTM from voting — shape mismatch)
+    # 5. Ensembles (exclude LSTM from voting — shape mismatch)
     ensemble_results  = build_ensembles(
         [r for r in all_results if r["name"] != "LSTM"],
         X_train, Y_train, X_test, Y_test, y_pers,
     )
     all_results += ensemble_results
 
-    # 8. Knowledge distillation — prefer LightGBM over CatBoost when available
+    # WeightedVoter.fit inside _oof_rmse mutates the constituent model objects
+    # (Ridge, XGBoost, etc.) in-place, leaving them fit on an OOF subset instead
+    # of the full training set.  Refit every sklearn model here so the state
+    # saved to GridFS by register_all is always fit on 100% of X_train.
+    for r in classical_results + optuna_results:
+        if hasattr(r["model"], "fit"):
+            r["model"].fit(X_train, Y_train)
+
+    # 6. Knowledge distillation — prefer LightGBM over CatBoost when available
     _DISTILL_CANDIDATES = ("RandomForest", "XGBoost", "LightGBM", "CatBoost")
     top3 = sorted(
         [r for r in all_results if r["name"] in _DISTILL_CANDIDATES],
@@ -488,7 +491,7 @@ def main():
         all_results.append({"name": "DistilledMLP", "model": wrapped_student, "metrics": s_metrics})
         print(f"[train] DistilledMLP: RMSE={s_metrics['rmse']:.2f}")
 
-    # 9. Conformal prediction calibration (on primary target aqi_24h)
+    # 7. Conformal prediction calibration (on primary target aqi_24h)
     best_non_lstm = sorted(
         [r for r in all_results if r["name"] not in ("LSTM", "DistilledMLP")],
         key=lambda r: r["metrics"]["rmse"],
@@ -499,19 +502,19 @@ def main():
     except Exception as e:
         print(f"[train] Conformal calibration skipped: {e}")
 
-    # 10. SHAP — requires a tree-based model
+    # 8. SHAP — requires a tree-based model
     _tree_names = ("RandomForest", "XGBoost", "CatBoost", "GradientBoosting")
     tree_results = [r for r in all_results if r["name"] in _tree_names]
     if tree_results:
         best_tree = sorted(tree_results, key=lambda r: r["metrics"]["rmse"])[0]
         compute_shap(best_tree["model"], X_test, feature_cols)
 
-    # 11. Feature ablation — results feed back into next run's FEATURE_GROUPS
+    # 9. Feature ablation — results feed back into next run's FEATURE_GROUPS
     ablation_deltas = run_ablation(df)
     if ablation_deltas:
         _persist_ablation_overrides(ablation_deltas)
 
-    # 12. Register all + Champion-Challenger
+    # 10. Register all + Champion-Challenger
     # Keras-based models (LSTM, DistilledMLP) are registered for leaderboard
     # comparison but excluded from champion promotion — the dashboard runs on
     # Render without TensorFlow, so the champion must be sklearn-compatible.
@@ -524,7 +527,7 @@ def main():
         r["metrics"]["champion_eligible"] = 0  # informational only
     register_all(sklearn_results + keras_results, champion_eligible_names={r["name"] for r in sklearn_results})
 
-    # 13. Save champion OOF predictions for hindcast chart
+    # 11. Save champion OOF predictions for hindcast chart
     try:
         from src.db import get_db as _get_db
         _champ_meta = _get_db()["model_metadata"].find_one(

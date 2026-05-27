@@ -5,13 +5,14 @@ PSI < 0.1  → no drift (green)
 PSI 0.1–0.2 → moderate drift (yellow, warn)
 PSI > 0.2  → significant drift (red, triggers alert)
 
-Baseline distribution is computed from the training window and saved to disk.
-Each hourly pipeline run computes PSI for all numeric features and logs results.
+Baseline distribution is computed from the training window and stored in
+MongoDB so it persists across GitHub Actions runs and is accessible on Render.
+Each hourly pipeline run computes PSI for all numeric features and logs to
+the drift_log collection (capped at 720 entries ~ 30 days of hourly checks).
 """
 import numpy as np
 import pandas as pd
 import pickle
-import json
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -20,7 +21,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from src.config import PSI_WARN_THRESHOLD, PSI_ALERT_THRESHOLD
 
 BASELINE_PATH = Path(__file__).parent.parent.parent / "drift_baseline.pkl"
-DRIFT_LOG_PATH = Path(__file__).parent.parent.parent / "drift_log.jsonl"
 
 _BINS = 10
 
@@ -39,19 +39,31 @@ def _psi_for_feature(baseline_vals: np.ndarray, current_vals: np.ndarray) -> flo
 
 
 def save_baseline(df: pd.DataFrame):
-    """Save training-set feature distributions as the drift baseline."""
+    """Save training-set feature distributions as the drift baseline to MongoDB."""
+    from src.db import get_db
     num_cols = df.select_dtypes(include=np.number).columns.tolist()
-    baseline = {col: df[col].dropna().values for col in num_cols}
-    with open(BASELINE_PATH, "wb") as f:
-        pickle.dump(baseline, f)
-    print(f"[drift_monitor] Baseline saved ({len(num_cols)} features)")
+    baseline = {col: df[col].dropna().values.tolist() for col in num_cols}
+    get_db()["drift_baseline"].update_one(
+        {"_id": "current"},
+        {"$set": {"features": baseline, "saved_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
+    print(f"[drift_monitor] Baseline saved to MongoDB ({len(num_cols)} features)")
 
 
 def load_baseline() -> dict:
-    if not BASELINE_PATH.exists():
-        return {}
-    with open(BASELINE_PATH, "rb") as f:
-        return pickle.load(f)
+    """Load baseline from MongoDB; fall back to local pickle for offline dev."""
+    try:
+        from src.db import get_db
+        doc = get_db()["drift_baseline"].find_one({"_id": "current"})
+        if doc and "features" in doc:
+            return {col: np.array(vals) for col, vals in doc["features"].items()}
+    except Exception:
+        pass
+    if BASELINE_PATH.exists():
+        with open(BASELINE_PATH, "rb") as f:
+            return pickle.load(f)
+    return {}
 
 
 def compute_psi(current_df: pd.DataFrame) -> dict[str, float]:
@@ -69,23 +81,40 @@ def compute_psi(current_df: pd.DataFrame) -> dict[str, float]:
 
 
 def log_psi(psi_scores: dict[str, float]):
-    """Append PSI results to a JSONL log file."""
+    """Insert PSI results into MongoDB drift_log collection."""
+    from src.db import get_db
     entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(timezone.utc),
         "psi": psi_scores,
         "drifted_features": [k for k, v in psi_scores.items() if v > PSI_ALERT_THRESHOLD],
     }
-    with open(DRIFT_LOG_PATH, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    col = get_db()["drift_log"]
+    col.insert_one(entry)
+    # Keep collection lean — drop anything older than 720 entries
+    total = col.count_documents({})
+    if total > 720:
+        oldest = col.find({}, {"_id": 1}).sort("timestamp", 1).limit(total - 720)
+        col.delete_many({"_id": {"$in": [d["_id"] for d in oldest]}})
+    entry["timestamp"] = entry["timestamp"].isoformat()
     return entry
 
 
 def load_drift_log(last_n: int = 720) -> list[dict]:
-    """Load the last N drift log entries (default 720 = 30 days of hourly checks)."""
-    if not DRIFT_LOG_PATH.exists():
+    """Load the last N drift log entries from MongoDB."""
+    try:
+        from src.db import get_db
+        docs = list(
+            get_db()["drift_log"]
+            .find({}, {"_id": 0})
+            .sort("timestamp", -1)
+            .limit(last_n)
+        )
+        for d in docs:
+            if hasattr(d.get("timestamp"), "isoformat"):
+                d["timestamp"] = d["timestamp"].isoformat()
+        return list(reversed(docs))
+    except Exception:
         return []
-    lines = DRIFT_LOG_PATH.read_text().strip().splitlines()
-    return [json.loads(l) for l in lines[-last_n:]]
 
 
 def check_drift(current_df: pd.DataFrame) -> tuple[dict, bool]:

@@ -252,10 +252,10 @@ if __name__ == "__main__":
     from src.feature_pipeline.feature_engineering import pm25_to_aqi
     computed = pm25_to_aqi(row["pm25"])
     print(f"\nVerification:")
-    print(f"  AQICN AQI (direct)    : {row['aqi_raw']:.0f}")
-    print(f"  PM2.5 µg/m³ (OW)      : {row['pm25']:.1f}")
-    print(f"  AQI computed from PM2.5: {computed:.0f}")
-    if abs(row["aqi_raw"] - computed) < 30:
-        print("  ✓ Consistent (within 30 AQI units)")
+    print(f"  AQICN AQI (raw, not used): {row['aqi_aqicn_raw']:.0f}")
+    print(f"  PM2.5 µg/m³ (OW)        : {row['pm25']:.1f}")
+    print(f"  AQI used (pm25_to_aqi)  : {row['aqi_from_api']:.0f}")
+    if abs(row["aqi_aqicn_raw"] - computed) > 30:
+        print(f"  ℹ️  AQICN vs PM2.5 differ by {abs(row['aqi_aqicn_raw']-computed):.0f} — expected for Karachi (different standard)")
     else:
-        print(f"  ⚠️  Mismatch — check PM2.5 source")
+        print("  ✓ AQICN and PM2.5-based AQI are consistent")

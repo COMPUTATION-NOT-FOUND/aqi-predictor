@@ -17,6 +17,7 @@ Champion Selection Rules (TOPSIS multi-criteria)
   Only the champion's binary artifacts are stored in GridFS (storage budget).
 """
 import io
+import json
 import pickle
 import zipfile
 from pathlib import Path
@@ -58,11 +59,17 @@ def _save_metadata(name: str, metrics: dict, tags: dict) -> None:
     )
 
 
-def _save_champion_artifacts(model, metrics: dict, tags: dict) -> None:
-    """Bundle all 4 champion artifacts into a ZIP and upload to GridFS.
+def _save_champion_artifacts(model, metrics: dict, tags: dict,
+                             feature_cols: list[str] | None = None) -> None:
+    """Bundle the champion artifacts into a ZIP and upload to GridFS.
 
     Deletes the previous champion ZIP first to reclaim storage space.
     Metadata is then upserted with the new artifacts_gridfs_id.
+
+    `feature_cols` is the exact ordered feature list the model was trained on. It
+    is written both into the ZIP (feature_cols.json) and onto the metadata doc, so
+    inference can reindex the live feature row to this exact order — eliminating the
+    train/serve column-ordering skew that previously corrupted predictions.
     """
     # Delete previous champion artifact to reclaim GridFS space
     prev = get_db()["model_metadata"].find_one(
@@ -88,6 +95,8 @@ def _save_champion_artifacts(model, metrics: dict, tags: dict) -> None:
             zf.writestr("model.pkl", pickle.dumps(model))
             zf.writestr("model_type.txt", "sklearn")
 
+        if feature_cols is not None:
+            zf.writestr("feature_cols.json", json.dumps(list(feature_cols)))
         if SCALER_PATH.exists():
             zf.write(str(SCALER_PATH), "scaler_bundle.pkl")
         if SHAP_PATH.exists():
@@ -103,6 +112,8 @@ def _save_champion_artifacts(model, metrics: dict, tags: dict) -> None:
     )
 
     doc = {**metrics, **tags, "model_name": "aqi_champion", "artifacts_gridfs_id": file_id}
+    if feature_cols is not None:
+        doc["feature_cols"] = list(feature_cols)
     get_db()["model_metadata"].update_one(
         {"model_name": "aqi_champion"},
         {"$set": doc},
@@ -111,7 +122,8 @@ def _save_champion_artifacts(model, metrics: dict, tags: dict) -> None:
     print(f"[register] Champion artifacts uploaded to GridFS (id={file_id})")
 
 
-def register_all(models_with_metrics: list[dict], champion_eligible_names: set = None) -> dict:
+def register_all(models_with_metrics: list[dict], champion_eligible_names: set = None,
+                 feature_cols: list[str] | None = None) -> dict:
     """
     Save all trained models to MongoDB.
     Applies TOPSIS-based Champion-Challenger logic to determine which model is promoted.
@@ -249,6 +261,7 @@ def register_all(models_with_metrics: list[dict], champion_eligible_names: set =
                 "promoted_from": best_name,
                 "model_type":    "keras" if _is_keras_model(best_entry["model"]) else "sklearn",
             },
+            feature_cols=feature_cols,
         )
         return {
             "champion":     best_name,

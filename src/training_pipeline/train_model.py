@@ -113,6 +113,13 @@ def load_and_split():
     n_train = int(n * 0.70)
     n_val   = int(n * 0.10)
 
+    # Capture the raw current AQI (per-row) BEFORE scaling — used to build a proper
+    # per-sample persistence baseline ("tomorrow = today") in raw AQI units.
+    current_aqi_all = (
+        df["aqi"].to_numpy(dtype=float) if "aqi" in df.columns
+        else np.zeros(n, dtype=float)
+    )
+
     # Fit scaler on raw training data only — no leakage into val/test
     df_raw_train = df.iloc[:n_train].copy()  # kept raw for drift baseline
     scaler = fit_scaler(df_raw_train)
@@ -129,15 +136,21 @@ def load_and_split():
     X_train, Y_train = X[:n_train],               Y[:n_train]
     X_val,   Y_val   = X[n_train:n_train+n_val],  Y[n_train:n_train+n_val]
     X_test,  Y_test  = X[n_train+n_val:],         Y[n_train+n_val:]
+    aqi_test         = current_aqi_all[n_train+n_val:]   # raw current AQI for test rows
 
     print(f"[train] Data split: train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
-    return X_train, Y_train, X_val, Y_val, X_test, Y_test, feature_cols, df, df_raw_train
+    return X_train, Y_train, X_val, Y_val, X_test, Y_test, feature_cols, df, df_raw_train, aqi_test
 
 
-def persistence_baseline(Y_train, Y_test, n_ahead: int = 0) -> np.ndarray:
-    """Persistence: predict today's AQI for all horizons."""
-    last_train_aqi = Y_train[-1, 0]
-    return np.full(Y_test.size, last_train_aqi)
+def persistence_baseline(aqi_current_test, n_horizons: int = len(TARGET_COLS)) -> np.ndarray:
+    """Per-sample persistence ("tomorrow = today"): each test row's own current AQI,
+    repeated across every horizon. Flattened to align with Y_test.ravel().
+
+    This is the correct naive baseline — the previous global-constant version
+    inflated RMSE_persistence and let near-mean models pass the skill gate.
+    """
+    arr = np.asarray(aqi_current_test, dtype=float).reshape(-1, 1)
+    return np.repeat(arr, n_horizons, axis=1).ravel()
 
 
 # ─── Training Helpers ─────────────────────────────────────────────────────────
@@ -236,11 +249,11 @@ def train_classical(X_train, Y_train, X_test, Y_test, y_persistence) -> list[dic
             oof = _oof_rmse(best_est, X_train, Y_train)
             best_est.fit(X_train, Y_train)   # refit on full train after OOF
 
-            train_preds = best_est.predict(X_train).ravel()
-            test_preds  = best_est.predict(X_test).ravel()
+            train_preds = best_est.predict(X_train)
+            test_preds  = best_est.predict(X_test)
 
-            train_rmse = float(np.sqrt(mean_squared_error(Y_train.ravel(), train_preds)))
-            metrics    = evaluate_all(Y_test.ravel(), test_preds, y_persistence)
+            train_rmse = float(np.sqrt(mean_squared_error(Y_train.ravel(), train_preds.ravel())))
+            metrics    = evaluate_all(Y_test, test_preds, y_persistence)
             metrics["oof_rmse"]    = oof
             metrics["train_rmse"]  = train_rmse
             metrics["overfit_flag"] = int(overfitting_flag(train_rmse, metrics["rmse"]))
@@ -285,10 +298,10 @@ def train_optuna(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence) 
             oof         = _oof_rmse(best_model, X_train, Y_train)
             best_model.fit(X_train, Y_train)
 
-            train_preds = best_model.predict(X_train).ravel()
-            test_preds  = best_model.predict(X_test).ravel()
-            train_rmse  = float(np.sqrt(mean_squared_error(Y_train.ravel(), train_preds)))
-            metrics     = evaluate_all(Y_test.ravel(), test_preds, y_persistence)
+            train_preds = best_model.predict(X_train)
+            test_preds  = best_model.predict(X_test)
+            train_rmse  = float(np.sqrt(mean_squared_error(Y_train.ravel(), train_preds.ravel())))
+            metrics     = evaluate_all(Y_test, test_preds, y_persistence)
             metrics["oof_rmse"]    = oof
             metrics["train_rmse"]  = train_rmse
             metrics["overfit_flag"] = int(overfitting_flag(train_rmse, metrics["rmse"]))
@@ -355,10 +368,10 @@ def train_lstm(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence) ->
             Xtr_s, Ytr_s, epochs=100, batch_size=64, verbose=0,
             callbacks=[EarlyStopping(patience=20, restore_best_weights=True)],
         )
-        test_preds  = final_model.predict(Xte_s, verbose=0).ravel()
+        test_preds  = final_model.predict(Xte_s, verbose=0)
         train_preds = final_model.predict(Xtr_s, verbose=0).ravel()
         train_rmse  = float(np.sqrt(mean_squared_error(Ytr_s.ravel(), train_preds)))
-        metrics     = evaluate_all(Yte_s.ravel(), test_preds)
+        metrics     = evaluate_all(Yte_s, test_preds)
         metrics["oof_rmse"]    = metrics["rmse"]   # LSTM uses val set for OOF proxy
         metrics["train_rmse"]  = train_rmse
         metrics["overfit_flag"] = int(overfitting_flag(train_rmse, metrics["rmse"]))
@@ -385,8 +398,8 @@ def build_ensembles(results: list[dict], X_train, Y_train, X_test, Y_test, y_per
 
     voter = WeightedVoter([r["model"] for r in top3], w_norm)
     voter.fit(X_train, Y_train)
-    test_preds = voter.predict(X_test).ravel()
-    v_metrics  = evaluate_all(Y_test.ravel(), test_preds, y_persistence)
+    test_preds = voter.predict(X_test)
+    v_metrics  = evaluate_all(Y_test, test_preds, y_persistence)
     v_metrics["oof_rmse"] = _oof_rmse(voter, X_train, Y_train)
     train_preds_v = voter.predict(X_train).ravel()
     v_metrics["train_rmse"]  = float(np.sqrt(mean_squared_error(Y_train.ravel(), train_preds_v)))
@@ -407,8 +420,8 @@ def build_ensembles(results: list[dict], X_train, Y_train, X_test, Y_test, y_per
             n_jobs=1,
         )
         stacker.fit(X_train, Y_train)
-        stack_preds = stacker.predict(X_test).ravel()
-        st_metrics  = evaluate_all(Y_test.ravel(), stack_preds, y_persistence)
+        stack_preds = stacker.predict(X_test)
+        st_metrics  = evaluate_all(Y_test, stack_preds, y_persistence)
         st_metrics["oof_rmse"] = _oof_rmse(stacker, X_train, Y_train)
         train_preds_s = stacker.predict(X_train).ravel()
         st_metrics["train_rmse"]  = float(np.sqrt(mean_squared_error(Y_train.ravel(), train_preds_s)))
@@ -479,14 +492,14 @@ def main():
     print(f"{'='*60}\n")
 
     # 1. Load data — scaler is fit inside load_and_split on raw training data
-    X_train, Y_train, X_val, Y_val, X_test, Y_test, feature_cols, df, df_raw_train = load_and_split()
+    X_train, Y_train, X_val, Y_val, X_test, Y_test, feature_cols, df, df_raw_train, aqi_test = load_and_split()
 
     # 2. Save drift baseline from RAW (unscaled) training distribution so it
     # matches the unscaled rows written by the hourly feature pipeline.
     save_baseline(df_raw_train)
 
-    # 3. Persistence baseline
-    y_pers = persistence_baseline(Y_train, Y_test)
+    # 3. Persistence baseline — per-sample current AQI ("tomorrow = today")
+    y_pers = persistence_baseline(aqi_test)
 
     # 4. Train all models
     classical_results = train_classical(X_train, Y_train, X_test, Y_test, y_pers)
@@ -524,8 +537,8 @@ def main():
         )
 
         wrapped_student = KerasWrapper(student)
-        test_preds_s    = wrapped_student.predict(X_test).ravel()
-        s_metrics       = evaluate_all(Y_test.ravel(), test_preds_s, y_pers)
+        test_preds_s    = wrapped_student.predict(X_test)
+        s_metrics       = evaluate_all(Y_test, test_preds_s, y_pers)
         s_metrics["oof_rmse"] = s_metrics["rmse"]
         all_results.append({"name": "DistilledMLP", "model": wrapped_student, "metrics": s_metrics})
         print(f"[train] DistilledMLP: RMSE={s_metrics['rmse']:.2f}")
@@ -564,7 +577,9 @@ def main():
     # Register Keras models with a flag so they appear in leaderboard
     for r in keras_results:
         r["metrics"]["champion_eligible"] = 0  # informational only
-    register_all(sklearn_results + keras_results, champion_eligible_names={r["name"] for r in sklearn_results})
+    register_all(sklearn_results + keras_results,
+                 champion_eligible_names={r["name"] for r in sklearn_results},
+                 feature_cols=feature_cols)
 
     # 11. Save champion OOF predictions for hindcast chart
     try:

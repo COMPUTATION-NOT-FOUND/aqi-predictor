@@ -42,6 +42,7 @@ FEATURE_GROUPS = {
     "stl_decomp":      True,   # aqi_trend, aqi_seasonal, aqi_residual
     "raw_pollutants":  True,   # PM2.5, PM10, O3, NO2, SO2, CO (keep True)
     "meteorology":     True,   # temperature, humidity, wind_speed, pressure, etc.
+    "forecast_leads":  True,   # forecasted weather + PM2.5 at t+24/48/72h (Open-Meteo/CAMS)
 }
 
 # Apply persisted ablation overrides — MongoDB is the source of truth so the

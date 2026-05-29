@@ -18,6 +18,8 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from datetime import timedelta
+
+import pandas as pd
 from pymongo import UpdateOne
 
 from src.db import get_db
@@ -26,19 +28,28 @@ from src.feature_pipeline.feature_engineering import pm25_to_aqi
 
 
 def fix_aqi_column(city: str = DEFAULT_CITY) -> int:
-    """Recompute the `aqi` field from stored `pm25` for every row.
+    """Recompute the `aqi` field as a 24h trailing-mean PM2.5 → AQI for every row.
 
-    Idempotent — safe to run repeatedly. Corrects live pipeline rows that
-    stored AQICN's composite AQI instead of pm25_to_aqi(pm25).
+    Matches the EPA-style averaging used by the backfill and the live pipeline, so
+    the stored observed AQI shares one definition everywhere. Idempotent.
     Returns the number of documents updated.
     """
     col = get_db()["aqi_features"]
+    docs = list(col.find(
+        {"city": city, "pm25": {"$exists": True, "$gt": 0}},
+        {"_id": 1, "timestamp": 1, "pm25": 1, "aqi": 1},
+    ).sort("timestamp", 1))
+    if not docs:
+        return 0
+
+    df = pd.DataFrame(docs)
+    df["pm25_24h"] = df["pm25"].rolling(24, min_periods=1).mean()
+
     updates = []
-    for row in col.find({"city": city, "pm25": {"$exists": True, "$gt": 0}},
-                        {"_id": 1, "pm25": 1, "aqi": 1}):
-        correct_aqi = float(pm25_to_aqi(row.get("pm25", 0)))
-        if abs(row.get("aqi", 0) - correct_aqi) > 1:
-            updates.append(UpdateOne({"_id": row["_id"]}, {"$set": {"aqi": correct_aqi}}))
+    for rec, pm25_24h in zip(docs, df["pm25_24h"].tolist()):
+        correct_aqi = float(pm25_to_aqi(pm25_24h))
+        if abs(rec.get("aqi", 0) - correct_aqi) > 1:
+            updates.append(UpdateOne({"_id": rec["_id"]}, {"$set": {"aqi": correct_aqi}}))
         if len(updates) >= 500:
             col.bulk_write(updates, ordered=False)
             updates.clear()
@@ -48,12 +59,11 @@ def fix_aqi_column(city: str = DEFAULT_CITY) -> int:
 
 
 def fill_null_targets(city: str = DEFAULT_CITY) -> int:
-    """Fill null aqi_{h}h targets using pm25_to_aqi(future_row["pm25"]).
+    """Fill null aqi_{h}h targets from the future row's `aqi` (24h-mean) field.
 
-    For each row at timestamp t with a missing target, looks up the stored
-    pm25 value from the row nearest t+h hours and converts via pm25_to_aqi.
-    Using pm25 directly (not the aqi field) makes this robust to any prior
-    aqi column contamination.
+    Run after fix_aqi_column, so every row's `aqi` is the correct 24h-mean AQI;
+    the target for a row at t is simply the observed `aqi` at t+h. This keeps the
+    target identical in definition to the feature and to the live forecast logging.
     Returns the number of documents updated.
     """
     col = get_db()["aqi_features"]
@@ -80,13 +90,13 @@ def fill_null_targets(city: str = DEFAULT_CITY) -> int:
                         "$gte": ts + timedelta(hours=h) - timedelta(minutes=30),
                         "$lte": ts + timedelta(hours=h) + timedelta(minutes=30),
                     },
-                    "pm25": {"$exists": True, "$gt": 0},
+                    "aqi": {"$exists": True, "$gt": 0},
                 },
-                {"pm25": 1},
+                {"aqi": 1},
                 sort=[("timestamp", 1)],
             )
             if future:
-                patch[f"aqi_{h}h"] = float(pm25_to_aqi(future["pm25"]))
+                patch[f"aqi_{h}h"] = float(future["aqi"])
 
         if patch:
             updates.append(UpdateOne({"_id": row["_id"]}, {"$set": patch}))

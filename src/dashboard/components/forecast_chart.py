@@ -208,6 +208,78 @@ def build_hindcast_chart(
     return fig
 
 
+# ─── Panel B (preferred) — Real Forecast Track Record ─────────────────────────
+
+def build_trackrecord_chart(track: dict | None) -> go.Figure:
+    """
+    Panel B: the model's *real* past forecasts vs what was actually observed.
+
+    Unlike the OOF hindcast (a training-time artifact), this uses forecasts the
+    system genuinely made (prediction_log) joined to the AQI observed at each
+    target time. RMSE / IoA / Skill are computed on those realized outcomes — an
+    honest, leakage-free track record of live performance.
+
+    `track` = {"observed": DataFrame[timestamp, aqi],
+               "pairs":    DataFrame[target_ts, horizon, predicted, observed]}
+    """
+    fig = go.Figure()
+    _add_aqi_zone_bands(fig)
+
+    observed = (track or {}).get("observed")
+    pairs    = (track or {}).get("pairs")
+    has_data = pairs is not None and not pairs.empty
+
+    if observed is not None and not observed.empty:
+        fig.add_trace(go.Scatter(
+            x=pd.to_datetime(observed["timestamp"], utc=True, errors="coerce"),
+            y=pd.to_numeric(observed["aqi"], errors="coerce"),
+            mode="lines", name="Observed (ground truth)",
+            line=dict(color="#89b4fa", width=2),
+            hovertemplate="%{y:.0f}<extra>Observed</extra>",
+        ))
+
+    if has_data:
+        _H_COLOR = {24: "#a6e3a1", 48: "#fab387", 72: "#f38ba8"}
+        for h in (24, 48, 72):
+            sub = pairs[pairs["horizon"] == h]
+            if sub.empty:
+                continue
+            fig.add_trace(go.Scatter(
+                x=pd.to_datetime(sub["target_ts"], utc=True, errors="coerce"),
+                y=pd.to_numeric(sub["predicted"], errors="coerce"),
+                mode="markers", name=f"Predicted {h}h ago",
+                marker=dict(size=6, color=_H_COLOR[h], symbol="circle",
+                            line=dict(color="#1e1e2e", width=1)),
+                hovertemplate=f"%{{y:.0f}}<extra>Forecast {h}h-ahead</extra>",
+            ))
+
+        from src.training_pipeline.evaluate_model import (
+            rmse as _rmse, index_of_agreement, skill_score as _ss,
+        )
+        y_true = pd.to_numeric(pairs["observed"], errors="coerce").to_numpy()
+        y_pred = pd.to_numeric(pairs["predicted"], errors="coerce").to_numpy()
+        mask = np.isfinite(y_true) & np.isfinite(y_pred)
+        if mask.sum() > 2:
+            yt, yp = y_true[mask], y_pred[mask]
+            # Persistence here = the observed value (forecast skill vs "no change").
+            _add_metric_annotation(fig, _rmse(yt, yp), index_of_agreement(yt, yp),
+                                   _ss(yt, yp, yt))
+    else:
+        fig.add_annotation(
+            text="No forecast track record yet — predictions accumulate as the "
+                 "pipeline runs.<br>Each forecast is scored once its target time arrives.",
+            xref="paper", yref="paper", x=0.5, y=0.5,
+            showarrow=False, align="center", font={"color": "#6c7086", "size": 13},
+        )
+
+    fig.update_layout(**_base_layout(
+        "Forecast Track Record — Predicted vs Observed",
+        "Real past forecasts (prediction_log) scored against the AQI observed at each "
+        "target time · IoA: Willmott (1981) · Skill: Murphy (1988)",
+    ))
+    return fig
+
+
 def _add_metric_annotation(fig: go.Figure, val_rmse: float, val_ioa: float, val_skill: float):
     """Render RMSE / IoA / Skill Score as a metric badge box on the figure."""
     ioa_color   = "#a6e3a1" if val_ioa   >= 0.3  else ("#f9e2af" if val_ioa   >= 0.2 else "#f38ba8")

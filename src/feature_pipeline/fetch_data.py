@@ -211,6 +211,116 @@ def fetch_historical_openweather(lat: float, lon: float, unix_start: int, unix_e
     return rows
 
 
+# ─── Forecast (forward-looking) data ──────────────────────────────────────────
+# These power the `forecast_leads` feature group: at inference time the model is
+# given the *forecasted* weather + PM2.5 for each target horizon (t+24/48/72h),
+# which is the single biggest source of forecasting skill.  Both endpoints are
+# free and need no API key (Open-Meteo weather + CAMS air quality).
+
+_OPENMETEO_FORECAST_URL    = "https://api.open-meteo.com/v1/forecast"
+_OPENMETEO_AQ_FORECAST_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
+
+# Canonical mapping forecast-feature → raw key used everywhere downstream.
+FORECAST_LEAD_FEATURES = [
+    "temperature", "humidity", "pressure", "wind_speed",
+    "cloud_cover", "precipitation_1h", "pm25_fc",
+]
+
+
+def _get_json_retry(url: str, params: dict, timeout: int = 20, tries: int = 3) -> dict:
+    """GET JSON with exponential backoff. Returns {} on final failure (non-fatal)."""
+    last_err = None
+    for attempt in range(tries):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            time.sleep(2 ** attempt)
+    print(f"[fetch] forecast GET failed ({url}): {last_err}")
+    return {}
+
+
+def fetch_forecast_openmeteo(
+    lat: float = DEFAULT_LAT, lon: float = DEFAULT_LON, days: int = 4,
+) -> pd.DataFrame:
+    """Hourly weather forecast (next `days` days) from Open-Meteo, indexed by UTC time."""
+    data = _get_json_retry(_OPENMETEO_FORECAST_URL, {
+        "latitude": lat, "longitude": lon, "timezone": "UTC", "forecast_days": days,
+        "hourly": ("temperature_2m,relative_humidity_2m,surface_pressure,"
+                   "wind_speed_10m,wind_direction_10m,cloud_cover,precipitation"),
+    })
+    hourly = data.get("hourly", {})
+    if not hourly.get("time"):
+        return pd.DataFrame()
+    df = pd.DataFrame(hourly).rename(columns={
+        "temperature_2m":       "temperature",
+        "relative_humidity_2m": "humidity",
+        "surface_pressure":     "pressure",
+        "wind_speed_10m":       "wind_speed",
+        "wind_direction_10m":   "wind_deg",
+        "precipitation":        "precipitation_1h",
+    })
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    return df.set_index("time")
+
+
+def fetch_aq_forecast_openmeteo(
+    lat: float = DEFAULT_LAT, lon: float = DEFAULT_LON, days: int = 4,
+) -> pd.DataFrame:
+    """Hourly PM2.5 forecast (CAMS via Open-Meteo) indexed by UTC time."""
+    data = _get_json_retry(_OPENMETEO_AQ_FORECAST_URL, {
+        "latitude": lat, "longitude": lon, "timezone": "UTC", "forecast_days": days,
+        "hourly": "pm2_5,pm10",
+    })
+    hourly = data.get("hourly", {})
+    if not hourly.get("time"):
+        return pd.DataFrame()
+    df = pd.DataFrame(hourly).rename(columns={"pm2_5": "pm25_fc", "pm10": "pm10_fc"})
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    return df.set_index("time")
+
+
+def fetch_forecast(
+    lat: float = DEFAULT_LAT,
+    lon: float = DEFAULT_LON,
+    horizons: tuple = (24, 48, 72),
+    now: Optional[datetime] = None,
+) -> dict:
+    """Return {h: {feature: value}} with the forecast nearest to now+h for each horizon.
+
+    Used by build_feature_row to populate the `forecast_leads` columns at inference
+    time. Returns an empty per-horizon dict when an API is unavailable; callers must
+    tolerate missing keys (build_feature_row fills 0.0).
+    """
+    now = now or datetime.now(timezone.utc)
+    wx = fetch_forecast_openmeteo(lat, lon)
+    aq = fetch_aq_forecast_openmeteo(lat, lon)
+
+    def _nearest(df: pd.DataFrame, target: datetime) -> Optional[pd.Series]:
+        if df.empty:
+            return None
+        pos = df.index.get_indexer([pd.Timestamp(target)], method="nearest")[0]
+        return df.iloc[pos] if pos >= 0 else None
+
+    out: dict = {}
+    for h in horizons:
+        target = now + pd.Timedelta(hours=h)
+        feat: dict = {}
+        wrow = _nearest(wx, target)
+        if wrow is not None:
+            for c in ["temperature", "humidity", "pressure", "wind_speed",
+                      "cloud_cover", "precipitation_1h"]:
+                if c in wx.columns:
+                    feat[c] = float(wrow[c])
+        arow = _nearest(aq, target)
+        if arow is not None and "pm25_fc" in aq.columns:
+            feat["pm25_fc"] = float(arow["pm25_fc"])
+        out[h] = feat
+    return out
+
+
 def fetch_current(
     city: str = DEFAULT_CITY,
     lat: float = DEFAULT_LAT,

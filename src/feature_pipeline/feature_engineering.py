@@ -48,6 +48,21 @@ def pm25_to_aqi(pm25: float) -> int:
     return 500
 
 
+def pm25_mean_to_aqi(pm25_values) -> int:
+    """AQI from the mean of a PM2.5 window.
+
+    The US EPA AQI is defined on a *24h-averaged* PM2.5, not an instantaneous
+    reading. Averaging the trailing window before converting removes most of the
+    hour-to-hour spikiness that makes the instantaneous target hard to forecast.
+    Non-finite / negative values are ignored; an empty window returns 0.
+    """
+    arr = np.asarray(list(pm25_values), dtype=float)
+    arr = arr[np.isfinite(arr) & (arr >= 0)]
+    if arr.size == 0:
+        return 0
+    return pm25_to_aqi(float(arr.mean()))
+
+
 # ─── Feature Computation ──────────────────────────────────────────────────────
 
 def _fourier(val: float, period: float):
@@ -147,10 +162,53 @@ def one_hot_day(day_of_week: int) -> dict:
     return {f"dow_{i}": int(day_of_week == i) for i in range(7)}
 
 
-def build_feature_row(raw: dict, history: pd.DataFrame, ts: datetime) -> dict:
+# ─── Forecast lead features ───────────────────────────────────────────────────
+# Forecasted conditions at each target horizon (t+24/48/72h). Same column names are
+# produced by build_feature_row (from the live forecast API) and by the backfill
+# (forward-shifted historical actuals), so training and serving stay consistent.
+
+# raw forecast key (from fetch_data.fetch_forecast) → lead column prefix
+FORECAST_LEAD_MAP = {
+    "temperature":      "temp",
+    "humidity":         "humidity",
+    "pressure":         "pressure",
+    "wind_speed":       "wind_speed",
+    "cloud_cover":      "cloud_cover",
+    "precipitation_1h": "precip",
+    "pm25_fc":          "pm25_fc",
+}
+
+
+def forecast_lead_cols(horizons=tuple(FORECAST_HOURS)) -> list[str]:
+    """Column names produced by the forecast_leads group, in a stable order."""
+    return [f"{prefix}_t{h}" for h in horizons for prefix in FORECAST_LEAD_MAP.values()]
+
+
+def compute_forecast_lead_features(forecast: dict, horizons=tuple(FORECAST_HOURS)) -> dict:
+    """Flatten a {h: {raw_key: value}} forecast dict into `{prefix}_t{h}` columns.
+
+    Missing keys default to 0.0 — the model tolerates absent forecast values the
+    same way it tolerates any other zero-filled feature.
+    """
+    forecast = forecast or {}
+    row: dict = {}
+    for h in horizons:
+        fh = forecast.get(h, {}) or {}
+        for raw_key, prefix in FORECAST_LEAD_MAP.items():
+            val = fh.get(raw_key, 0.0)
+            row[f"{prefix}_t{h}"] = float(val) if val is not None else 0.0
+    return row
+
+
+def build_feature_row(raw: dict, history: pd.DataFrame, ts: datetime,
+                      forecast: dict | None = None) -> dict:
     """
     Combine all feature groups into a single flat dict.
     Respects FEATURE_GROUPS toggles from config.
+
+    `forecast` is an optional {h: {raw_key: value}} dict (from fetch_forecast) used
+    to populate the forecast_leads columns at inference time. During backfill the
+    same columns are produced by forward-shifting historical actuals instead.
     """
     row = {"timestamp": ts.isoformat(), "city": raw.get("city", "karachi")}
 
@@ -213,6 +271,9 @@ def build_feature_row(raw: dict, history: pd.DataFrame, ts: datetime) -> dict:
         sf = compute_stl_features(history)
         row.update(sf)
 
+    if FEATURE_GROUPS.get("forecast_leads"):
+        row.update(compute_forecast_lead_features(forecast))
+
     return row
 
 
@@ -247,6 +308,7 @@ FEATURE_GROUP_COLS: dict[str, list[str]] = {
                         "rolling_std_24h", "rolling_min_24h", "rolling_max_24h",
                         "aqi_pct_change_24h"],
     "stl_decomp":      ["aqi_trend", "aqi_seasonal", "aqi_residual"],
+    "forecast_leads":  forecast_lead_cols(),
 }
 
 

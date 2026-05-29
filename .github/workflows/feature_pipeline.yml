@@ -33,6 +33,15 @@ jobs:
           MLFLOW_TRACKING_URI: "mlruns"
         run: python src/feature_pipeline/pipeline.py
 
+      - name: Precompute 3-day forecast for the dashboard
+        env:
+          AQICN_API_KEY:       ${{ secrets.AQICN_API_KEY }}
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+          MONGODB_URI:         ${{ secrets.MONGODB_URI }}
+          MONGODB_DB_NAME:     ${{ secrets.MONGODB_DB_NAME }}
+          DEFAULT_CITY:        "karachi"
+        run: python src/feature_pipeline/predict.py
+
       - name: Send drift alert email (if PSI > 0.2)
         if: failure() && env.ALERT_EMAIL != ''
         env:

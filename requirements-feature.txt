@@ -5,3 +5,10 @@ numpy>=1.26.0
 scikit-learn>=1.4.0
 statsmodels>=0.14.0
 pymongo[srv]>=4.6.0
+
+# Needed by the hourly predict step to unpickle/run the champion model
+# (any of these may be the promoted champion) and compute conformal intervals.
+xgboost>=2.0.0
+lightgbm>=4.3.0
+catboost>=1.2.0
+mapie>=0.8.0

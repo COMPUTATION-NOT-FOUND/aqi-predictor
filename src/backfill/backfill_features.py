@@ -161,34 +161,58 @@ def backfill(
     df_imputed = impute_fn(df_raw.copy())
     df_imputed["city"] = city
 
+    # 24h trailing-mean PM2.5 → AQI (EPA-style averaging) used for both the `aqi`
+    # feature and the aqi_{h}h targets, so train and serve share one definition.
+    df_imputed["pm25_24h"] = df_imputed["pm25"].rolling(24, min_periods=1).mean()
+
     # Compute AQI from PM2.5 and build feature rows
     feature_rows = []
     history_so_far = pd.DataFrame()
 
+    # Map from the forecast-lead raw key → the column name in df_imputed it reads from.
+    # Mirrors fetch_forecast()'s output so training (forward-shifted actuals) and serving
+    # (live forecast API) produce the same forecast_leads columns.
+    _LEAD_SOURCE = {
+        "temperature": "temperature", "humidity": "humidity", "pressure": "pressure",
+        "wind_speed": "wind_speed", "cloud_cover": "cloud_cover",
+        "precipitation_1h": "precipitation_1h", "pm25_fc": "pm25",
+    }
+
     for ts, raw in df_imputed.iterrows():
         raw_dict = raw.to_dict()
         raw_dict["city"] = city
-        aqi = pm25_to_aqi(raw_dict.get("pm25", 0))
+        aqi = pm25_to_aqi(raw_dict.get("pm25_24h", raw_dict.get("pm25", 0)))
         raw_dict["aqi_raw"] = aqi
 
-        # Build feature row with whatever history we have so far
-        row = build_feature_row(raw_dict, history_so_far, ts.to_pydatetime())
-        row["aqi"] = aqi
-
-        # Add targets: look ahead in the imputed data
+        # Forecast leads for training rows = the actual future values (forward shift).
+        # At inference these same columns come from the Open-Meteo/CAMS forecast API.
+        forecast: dict = {}
         for h in FORECAST_HOURS:
             future_ts = ts + pd.Timedelta(hours=h)
             if future_ts in df_imputed.index:
-                row[f"aqi_{h}h"] = pm25_to_aqi(df_imputed.loc[future_ts, "pm25"])
+                fr = df_imputed.loc[future_ts]
+                forecast[h] = {k: float(fr.get(src, 0) or 0) for k, src in _LEAD_SOURCE.items()}
+            else:
+                forecast[h] = {}
+
+        # Build feature row with whatever history we have so far
+        row = build_feature_row(raw_dict, history_so_far, ts.to_pydatetime(), forecast=forecast)
+        row["aqi"] = aqi
+
+        # Add targets: 24h-mean AQI at the future timestamp (matches the `aqi` feature).
+        for h in FORECAST_HOURS:
+            future_ts = ts + pd.Timedelta(hours=h)
+            if future_ts in df_imputed.index:
+                row[f"aqi_{h}h"] = pm25_to_aqi(df_imputed.loc[future_ts, "pm25_24h"])
             else:
                 row[f"aqi_{h}h"] = None
 
         feature_rows.append(row)
 
-        # Accumulate history
+        # Accumulate history — keep enough rows to cover the 168h lag window.
         history_row = pd.DataFrame([{"timestamp": ts, "aqi": aqi, "pm25": raw_dict.get("pm25", 0),
                                      "pressure": raw_dict.get("pressure", 1013)}])
-        history_so_far = pd.concat([history_so_far, history_row], ignore_index=True).tail(72)
+        history_so_far = pd.concat([history_so_far, history_row], ignore_index=True).tail(200)
 
     df_features = pd.DataFrame(feature_rows)
     # Drop rows with any null targets (can't train on those)

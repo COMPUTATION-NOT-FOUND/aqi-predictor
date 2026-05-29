@@ -13,9 +13,9 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from src.config import DEFAULT_CITY, DEFAULT_LAT, DEFAULT_LON, FORECAST_HOURS
-from src.feature_pipeline.fetch_data import fetch_current
+from src.feature_pipeline.fetch_data import fetch_current, fetch_forecast
 from src.feature_pipeline.feature_engineering import (
-    build_feature_row, pm25_to_aqi,
+    build_feature_row, pm25_to_aqi, pm25_mean_to_aqi,
 )
 from src.feature_pipeline.store_features import insert_features, fetch_recent
 from src.feature_pipeline.drift_monitor import check_drift
@@ -47,15 +47,30 @@ def run_pipeline(city: str = DEFAULT_CITY, lat: float = DEFAULT_LAT, lon: float 
     # 1. Fetch raw data
     raw = fetch_current(city=city, lat=lat, lon=lon)
 
-    # 2. Fetch recent history for lag/rolling features (last 72 rows)
+    # 2. Fetch recent history for lag/rolling features.
+    # Window must cover the longest lag (168h) plus headroom so 72h/168h lags populate.
     try:
-        history = fetch_recent(city, n=72)
+        history = fetch_recent(city, n=200)
     except Exception:
         history = pd.DataFrame()
 
-    # 3. Build feature row (includes aqi via build_feature_row → pm25_to_aqi / aqi_from_api)
-    ts  = datetime.now(timezone.utc)
-    row = build_feature_row(raw, history, ts)
+    # 2b. Fetch the forward-looking forecast for the forecast_leads group.
+    ts = datetime.now(timezone.utc)
+    try:
+        forecast = fetch_forecast(lat=lat, lon=lon, horizons=tuple(FORECAST_HOURS), now=ts)
+    except Exception as e:
+        print(f"[pipeline] forecast fetch failed ({e}) — lead features will be 0")
+        forecast = {}
+
+    # 2c. Current AQI = 24h trailing-mean PM2.5 → AQI (EPA-style; matches backfill/targets).
+    pm25_window = []
+    if not history.empty and "pm25" in history.columns:
+        pm25_window = history["pm25"].tail(23).tolist()
+    pm25_window.append(raw.get("pm25", 0))
+    raw["aqi_from_api"] = pm25_mean_to_aqi(pm25_window)
+
+    # 3. Build feature row (includes aqi via build_feature_row → aqi_from_api 24h mean)
+    row = build_feature_row(raw, history, ts, forecast=forecast)
 
     df = pd.DataFrame([row])
 

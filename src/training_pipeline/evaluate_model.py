@@ -88,19 +88,35 @@ def overfitting_flag(train_rmse: float, val_rmse: float) -> bool:
 
 
 def evaluate_all(y_true, y_pred, y_persistence=None, prefix: str = "") -> dict:
-    """Compute all metrics. y_* can be 1D or 2D (multi-output averaged)."""
-    y_true = np.asarray(y_true, dtype=float).ravel()
-    y_pred = np.asarray(y_pred, dtype=float).ravel()
+    """Compute all metrics.
+
+    y_* may be 1D or 2D (n_samples, n_horizons). Pooled metrics flatten across all
+    horizons; when 2D inputs are given, per-horizon metrics (rmse_d1, mae_d1, r2_d1…)
+    are also emitted so the leaderboard can show how error grows with lead time.
+    """
+    yt2 = np.asarray(y_true, dtype=float)
+    yp2 = np.asarray(y_pred, dtype=float)
+
+    y_true_flat = yt2.ravel()
+    y_pred_flat = yp2.ravel()
 
     metrics = {
-        f"{prefix}rmse": rmse(y_true, y_pred),
-        f"{prefix}mae":  mae(y_true, y_pred),
-        f"{prefix}r2":   r2(y_true, y_pred),
-        f"{prefix}ioa":  index_of_agreement(y_true, y_pred),
+        f"{prefix}rmse": rmse(y_true_flat, y_pred_flat),
+        f"{prefix}mae":  mae(y_true_flat, y_pred_flat),
+        f"{prefix}r2":   r2(y_true_flat, y_pred_flat),
+        f"{prefix}ioa":  index_of_agreement(y_true_flat, y_pred_flat),
     }
+
+    # Per-horizon breakdown (only meaningful for aligned 2D multi-output inputs)
+    if yt2.ndim == 2 and yp2.ndim == 2 and yt2.shape == yp2.shape and yt2.shape[1] > 1:
+        for i in range(yt2.shape[1]):
+            metrics[f"{prefix}rmse_d{i+1}"] = rmse(yt2[:, i], yp2[:, i])
+            metrics[f"{prefix}mae_d{i+1}"]  = mae(yt2[:, i], yp2[:, i])
+            metrics[f"{prefix}r2_d{i+1}"]   = r2(yt2[:, i], yp2[:, i])
+
     if y_persistence is not None:
         y_pers = np.asarray(y_persistence, dtype=float).ravel()
-        metrics[f"{prefix}skill_score"] = skill_score(y_true, y_pred, y_pers)
+        metrics[f"{prefix}skill_score"] = skill_score(y_true_flat, y_pred_flat, y_pers)
     return metrics
 
 

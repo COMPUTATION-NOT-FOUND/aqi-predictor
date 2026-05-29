@@ -1,23 +1,16 @@
 """
-Load champion model from MongoDB and run inference for the dashboard.
-Returns 3-day AQI predictions with conformal prediction intervals.
+Dashboard data-access layer (framework-agnostic).
 
-Caching strategy
-----------------
-- _MODEL_CACHE    : champion model + scaler — never expires
-- _FEATURES_CACHE : recent feature history — TTL 3600 s
-- _METADATA_CACHE : leaderboard model metadata — TTL 1800 s
-- _SHAP_CACHE     : SHAP values — TTL 3600 s
-
-All caches survive across Dash callbacks within one container lifecycle.
-A background thread pre-warms _METADATA_CACHE and _SHAP_CACHE at module import
-time so the first tab switch feels instant.
+The dashboard NEVER runs model inference live. Forecasts are precomputed hourly by
+src/feature_pipeline/predict.py and written to the `predictions` collection; this
+module just reads them (plus feature history, the forecast track record, SHAP values,
+and the leaderboard). The Streamlit app wraps these with @st.cache_data for caching
+and invalidation — so there is no module-level cache machinery here.
 """
 import io
 import pickle
 import zipfile
-import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -25,382 +18,147 @@ import pandas as pd
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-from src.config import DEFAULT_CITY, DEFAULT_LAT, DEFAULT_LON, FORECAST_HOURS
+from src.config import DEFAULT_CITY
 from src.db import get_db, get_gridfs
 from src.feature_pipeline.store_features import fetch_recent
-from src.feature_pipeline.feature_engineering import load_scaler, apply_scaler, pm25_to_aqi
-from src.feature_pipeline.fetch_data import fetch_current
-from src.feature_pipeline.feature_engineering import build_feature_row
-from src.training_pipeline.conformal import load_calibrator, predict_with_intervals
-from src.training_pipeline.wrappers import FirstOutputWrapper  # noqa: F401 — needed for conformal calibrator unpickling
 
 SHAP_PATH = Path(__file__).parent.parent.parent / "shap_values.pkl"
 
-# ─── Module-level caches ──────────────────────────────────────────────────────
-
-# Model cache: stores model + scaler + the champion's trained_at version string.
-# Never re-downloads unless MongoDB shows a newer champion (checked every hour).
-_MODEL_CACHE: dict = {"model": None, "scaler": None, "version": None, "checked_at": None}
-_MODEL_VERSION_CHECK_INTERVAL = 3600   # re-query MongoDB for champion version once per hour
-
-# Feature history: TTL matches the dashboard refresh interval (5 min).
-# No point caching for 1 hour when the page already refreshes every 5 min.
-_FEATURES_CACHE: dict = {"data": None, "city": None, "ts": None}
-_FEATURES_CACHE_TTL = 300              # 5 minutes
-
-# Leaderboard metadata: changes only after daily training run.
-_METADATA_CACHE: dict = {"data": None, "ts": None}
-_METADATA_CACHE_TTL = 300              # 5 minutes — match the dashboard refresh interval
-
-# SHAP values: changes only after daily training run.
-_SHAP_CACHE: dict = {"data": None, "ts": None}
-_SHAP_CACHE_TTL = 3600                 # 1 hour
-
-# Conformal calibrator: loaded from disk or GridFS — cache to avoid repeated I/O.
-_CONFORMAL_CACHE: dict = {"calibrator": None, "ts": None}
-_CONFORMAL_CACHE_TTL = 3600            # 1 hour
-
-# Single lock protecting all in-memory cache mutations.
-_cache_lock = threading.Lock()
-
-_PREDICTION_LOG_TTL_DAYS = 30
+# A precomputed forecast older than this is flagged stale in the UI.
+_PREDICTION_STALE_MINUTES = 180
 
 
-# ─── Champion model ───────────────────────────────────────────────────────────
+# ─── Feature history (Panel A / Panel C context) ──────────────────────────────
 
-def _fetch_champion_version() -> str | None:
-    """Query MongoDB for the current champion's trained_at timestamp. Returns None on error."""
+def get_recent_features(city: str = DEFAULT_CITY, n: int = 200) -> pd.DataFrame:
+    """Most recent n feature rows for the city (observed AQI history)."""
     try:
-        meta = get_db()["model_metadata"].find_one(
-            {"model_name": "aqi_champion"}, {"trained_at": 1, "artifacts_gridfs_id": 1}
-        )
-        if meta and meta.get("artifacts_gridfs_id"):
-            return meta.get("trained_at", "unknown")
-    except Exception:
-        pass
-    return None
-
-
-def load_champion_model():
-    """Download and cache the champion model from MongoDB GridFS.
-
-    Cache invalidation: re-queries MongoDB for the champion's trained_at version
-    once per _MODEL_VERSION_CHECK_INTERVAL seconds. If the version changed
-    (new champion promoted), evicts the cache and re-downloads automatically.
-
-    Race condition protection: the lock is held for the entire download so only
-    one thread downloads; subsequent threads wait and then return the cached copy.
-    """
-    import traceback
-    now = datetime.now(timezone.utc)
-
-    with _cache_lock:
-        cached_model   = _MODEL_CACHE["model"]
-        cached_version = _MODEL_CACHE["version"]
-        checked_at     = _MODEL_CACHE["checked_at"]
-
-        # Fast path: model loaded and version check not due yet
-        if cached_model is not None and checked_at is not None:
-            elapsed = (now - checked_at).total_seconds()
-            if elapsed < _MODEL_VERSION_CHECK_INTERVAL:
-                print("[inference] Returning cached champion model")
-                return cached_model, _MODEL_CACHE["scaler"]
-
-        # Version check due (or first load) — query MongoDB inside the lock
-        # so only one thread does the check + possible download
-        current_version = _fetch_champion_version()
-        if current_version is None:
-            if cached_model is not None:
-                # MongoDB unreachable but we have a cached model — keep serving it
-                _MODEL_CACHE["checked_at"] = now
-                return cached_model, _MODEL_CACHE["scaler"]
-            print("[inference] No champion model artifacts found in MongoDB")
-            return None, None
-
-        _MODEL_CACHE["checked_at"] = now
-
-        if cached_model is not None and current_version == cached_version:
-            print(f"[inference] Champion unchanged (version={current_version}) — using cache")
-            return cached_model, _MODEL_CACHE["scaler"]
-
-        if cached_model is not None:
-            print(f"[inference] New champion detected ({cached_version} → {current_version}) — reloading")
-        else:
-            print(f"[inference] Loading champion model version={current_version}...")
-
-        # Download inside the lock — other threads block here and then return
-        # the freshly cached model, avoiding duplicate downloads
-        try:
-            meta = get_db()["model_metadata"].find_one({"model_name": "aqi_champion"})
-            zip_bytes = get_gridfs().get(meta["artifacts_gridfs_id"]).read()
-            buf = io.BytesIO(zip_bytes)
-            model = None
-            scaler = None
-
-            with zipfile.ZipFile(buf, "r") as zf:
-                model_type = "sklearn"
-                if "model_type.txt" in zf.namelist():
-                    model_type = zf.read("model_type.txt").decode().strip()
-
-                if model_type == "keras":
-                    try:
-                        import tempfile
-                        import tensorflow as tf
-                        with tempfile.TemporaryDirectory() as td:
-                            zf.extract("model.keras", td)
-                            model = tf.keras.models.load_model(os.path.join(td, "model.keras"))
-                        print("[inference] Champion Keras model loaded")
-                    except ImportError:
-                        print("[inference] Champion is Keras but tensorflow not installed")
-                        return None, None
-                else:
-                    model = pickle.loads(zf.read("model.pkl"))
-                    print("[inference] Champion sklearn model loaded")
-
-                if "scaler_bundle.pkl" in zf.namelist():
-                    scaler = pickle.loads(zf.read("scaler_bundle.pkl"))
-
-            _MODEL_CACHE["model"]   = model
-            _MODEL_CACHE["scaler"]  = scaler
-            _MODEL_CACHE["version"] = current_version
-            # Also invalidate SHAP and conformal caches since a new model was loaded
-            _SHAP_CACHE["data"]           = None
-            _SHAP_CACHE["ts"]             = None
-            _CONFORMAL_CACHE["calibrator"] = None
-            _CONFORMAL_CACHE["ts"]         = None
-            return model, scaler
-
-        except Exception as e:
-            print(f"[inference] CHAMPION LOAD FAILED: {e}\n{traceback.format_exc()}")
-            return None, None
-
-
-# ─── Feature history ──────────────────────────────────────────────────────────
-
-def get_recent_features(city: str = DEFAULT_CITY, n: int = 48) -> pd.DataFrame:
-    """Fetch the most recent n feature rows for the given city (cached)."""
-    now = datetime.now(timezone.utc)
-    with _cache_lock:
-        cached = _FEATURES_CACHE
-        if (
-            cached["data"] is not None
-            and cached["city"] == city
-            and cached["ts"] is not None
-            and (now - cached["ts"]).total_seconds() < _FEATURES_CACHE_TTL
-        ):
-            print("[inference] Returning cached feature history")
-            return cached["data"]
-
-    print("[inference] Fetching feature history from MongoDB...")
-    result = fetch_recent(city, n=n)
-    with _cache_lock:
-        _FEATURES_CACHE["data"] = result
-        _FEATURES_CACHE["city"] = city
-        _FEATURES_CACHE["ts"]   = now
-    return result
-
-
-# ─── Conformal calibrator cache ───────────────────────────────────────────────
-
-def _get_cached_calibrator():
-    """Return cached conformal calibrator, reloading after TTL expiry."""
-    now = datetime.now(timezone.utc)
-    with _cache_lock:
-        if (
-            _CONFORMAL_CACHE["calibrator"] is not None
-            and _CONFORMAL_CACHE["ts"] is not None
-            and (now - _CONFORMAL_CACHE["ts"]).total_seconds() < _CONFORMAL_CACHE_TTL
-        ):
-            return _CONFORMAL_CACHE["calibrator"]
-
-    calibrator = load_calibrator()
-    with _cache_lock:
-        _CONFORMAL_CACHE["calibrator"] = calibrator
-        _CONFORMAL_CACHE["ts"]         = now
-    return calibrator
-
-
-# ─── 3-day prediction ─────────────────────────────────────────────────────────
-
-def predict_3day(
-    city: str = DEFAULT_CITY,
-    lat:  float = DEFAULT_LAT,
-    lon:  float = DEFAULT_LON,
-) -> dict:
-    """
-    Run end-to-end inference:
-    1. Fetch latest raw data
-    2. Build feature row
-    3. Apply scaler
-    4. Predict with champion model
-    5. Add conformal intervals for aqi_24h
-
-    Always returns a valid dict — never raises.
-    """
-    # Fetch history first so it can serve as AQICN fallback when the station is down.
-    try:
-        history = get_recent_features(city=city, n=72)
+        return fetch_recent(city, n=n)
     except Exception as e:
         print(f"[inference] get_recent_features failed: {e}")
-        history = pd.DataFrame()
+        return pd.DataFrame()
 
-    current_aqi = 0
-    raw = {}
+
+# ─── Latest precomputed forecast (Panel C + gauges) ────────────────────────────
+
+def load_latest_prediction(city: str = DEFAULT_CITY) -> dict:
+    """Read the most recent precomputed forecast document.
+
+    Always returns a dict. When no forecast exists yet, `error` is set and the
+    horizon values are 0 — the app shows an explicit "forecast pending" state
+    rather than silent persistence/fallback values.
+    """
+    base = {
+        "current_aqi": 0.0, "aqi_24h": 0.0, "aqi_48h": 0.0, "aqi_72h": 0.0,
+        "lower_24h": 0.0, "upper_24h": 0.0,
+        "predicted_at": None, "model_version": None,
+        "stale": False, "age_minutes": None, "error": None,
+    }
     try:
-        raw = fetch_current(city=city, lat=lat, lon=lon)
-        # aqi_from_api is now pm25_to_aqi(openweather_pm25) — always reliable.
-        # Falls back to pm25 from the raw dict if fetch_current somehow returns 0.
-        aqi_from_api = float(raw.get("aqi_from_api") or 0)
-        if aqi_from_api > 0:
-            current_aqi = aqi_from_api
-        else:
-            current_aqi = pm25_to_aqi(raw.get("pm25", 0))
+        doc = get_db()["predictions"].find_one({"city": city}, sort=[("predicted_at", -1)])
     except Exception as e:
-        print(f"[inference] fetch_current failed: {e}")
-        return {
-            "current_aqi": 0,
-            "aqi_24h": 0, "aqi_48h": 0, "aqi_72h": 0,
-            "lower_24h": 0, "upper_24h": 0,
-            "error": f"Could not fetch live data: {e}",
-        }
+        base["error"] = f"Could not reach the database: {e}"
+        return base
 
-    try:
-        ts  = datetime.now(timezone.utc)
-        row = build_feature_row(raw, history, ts)
-        df_row = pd.DataFrame([row])
-    except Exception as e:
-        print(f"[inference] build_feature_row failed: {e}")
-        return {
-            "current_aqi": current_aqi,
-            "aqi_24h": current_aqi, "aqi_48h": current_aqi, "aqi_72h": current_aqi,
-            "lower_24h": current_aqi * 0.85, "upper_24h": current_aqi * 1.15,
-            "error": f"Feature engineering failed: {e}",
-        }
+    if not doc:
+        base["error"] = "No forecast yet — the prediction pipeline has not run."
+        return base
 
-    model, scaler = load_champion_model()
-    if model is None:
-        return {
-            "current_aqi": current_aqi,
-            "aqi_24h": current_aqi, "aqi_48h": current_aqi, "aqi_72h": current_aqi,
-            "lower_24h": current_aqi * 0.85, "upper_24h": current_aqi * 1.15,
-            "error": "No champion model yet — run the training pipeline first.",
-        }
+    by_h = {f["horizon"]: f for f in doc.get("forecasts", [])}
+    predicted_at = doc.get("predicted_at")
+    age_minutes = None
+    stale = False
+    if isinstance(predicted_at, datetime):
+        if predicted_at.tzinfo is None:
+            predicted_at = predicted_at.replace(tzinfo=timezone.utc)
+        age_minutes = (datetime.now(timezone.utc) - predicted_at).total_seconds() / 60.0
+        stale = age_minutes > _PREDICTION_STALE_MINUTES
 
-    try:
-        if scaler is not None:
-            df_row = apply_scaler(df_row, scaler)
-
-        drop_cols = ["timestamp", "city", "aqi_24h", "aqi_48h", "aqi_72h"]
-        # Sort alphabetically — MongoDB returns training columns in alphabetical order,
-        # so the stored model's feature positions are alphabetically indexed.
-        feat_cols = sorted(c for c in df_row.columns if c not in drop_cols and df_row[c].dtype != object)
-        X = df_row[feat_cols].values
-        X = np.where(np.isfinite(X), X, 0.0)
-
-        try:
-            import tensorflow as tf
-            if isinstance(model, tf.keras.Model):
-                expected_features = model.input_shape[-1]
-                if X.shape[1] != expected_features:
-                    return {
-                        "current_aqi": current_aqi,
-                        "aqi_24h": current_aqi, "aqi_48h": current_aqi, "aqi_72h": current_aqi,
-                        "lower_24h": current_aqi * 0.85, "upper_24h": current_aqi * 1.15,
-                        "error": (
-                            f"Champion (LSTM) trained on {expected_features} features, "
-                            f"current set has {X.shape[1]}. "
-                            "Training pipeline will fix this on next run."
-                        ),
-                    }
-                X = X.reshape(1, 1, expected_features)
-        except ImportError:
-            pass
-
-        preds = model.predict(X)[0]
-        if preds.ndim == 0:
-            preds = np.array([preds, preds, preds])
-
-        aqi_24h = float(np.clip(preds[0], 0, 500))
-        aqi_48h = float(np.clip(preds[1] if len(preds) > 1 else preds[0], 0, 500))
-        aqi_72h = float(np.clip(preds[2] if len(preds) > 2 else preds[0], 0, 500))
-
-    except Exception as e:
-        print(f"[inference] predict failed: {e}")
-        return {
-            "current_aqi": current_aqi,
-            "aqi_24h": current_aqi, "aqi_48h": current_aqi, "aqi_72h": current_aqi,
-            "lower_24h": current_aqi * 0.85, "upper_24h": current_aqi * 1.15,
-            "error": f"Prediction failed: {e}",
-        }
-
-    mapie = _get_cached_calibrator()
-    lower_24h, upper_24h = aqi_24h * 0.85, aqi_24h * 1.15
-    if mapie is not None:
-        try:
-            _, lo, hi = predict_with_intervals(mapie, X)
-            lower_24h, upper_24h = float(lo[0]), float(hi[0])
-        except Exception:
-            pass
-
-    result = {
-        "current_aqi": current_aqi,
-        "aqi_24h":     aqi_24h,
-        "aqi_48h":     aqi_48h,
-        "aqi_72h":     aqi_72h,
-        "lower_24h":   max(0, lower_24h),
-        "upper_24h":   min(500, upper_24h),
-        "feature_row": row,
+    return {
+        "current_aqi":   float(doc.get("current_aqi", 0) or 0),
+        "aqi_24h":       float(by_h.get(24, {}).get("aqi", 0) or 0),
+        "aqi_48h":       float(by_h.get(48, {}).get("aqi", 0) or 0),
+        "aqi_72h":       float(by_h.get(72, {}).get("aqi", 0) or 0),
+        "lower_24h":     float(by_h.get(24, {}).get("lower") or 0),
+        "upper_24h":     float(by_h.get(24, {}).get("upper") or 0),
+        "predicted_at":  predicted_at,
+        "model_version": doc.get("model_version"),
+        "stale":         stale,
+        "age_minutes":   age_minutes,
+        "error":         None,
     }
 
-    with _cache_lock:
-        model_ver = _MODEL_CACHE.get("version") or "unknown"
 
-    threading.Thread(
-        target=_log_prediction_async,
-        args=(city, current_aqi, aqi_24h, aqi_48h, aqi_72h, model_ver),
-        daemon=True,
-        name="prediction-logger",
-    ).start()
+# ─── Forecast track record (Panel B — real predicted vs realized) ──────────────
 
-    return result
+def load_forecast_trackrecord(city: str = DEFAULT_CITY, days: int = 14) -> dict:
+    """Join past logged forecasts to the AQI that was actually observed at their
+    target time.
 
-
-# ─── Live prediction logging ──────────────────────────────────────────────────
-
-def _log_prediction_async(
-    city: str,
-    current_aqi: float,
-    aqi_24h: float,
-    aqi_48h: float,
-    aqi_72h: float,
-    model_version: str = "unknown",
-) -> None:
-    """Insert one prediction row into prediction_log.
-
-    The TTL index on logged_at (expireAfterSeconds=2592000) handles
-    automatic 30-day rolling-window cleanup — no application pruning needed.
+    Returns {"observed": DataFrame[timestamp, aqi], "pairs": DataFrame[target_ts,
+    horizon, predicted, observed]}. The pairs power the predicted-vs-observed
+    comparison and its honest RMSE/IoA/Skill (computed on realized outcomes).
     """
+    empty = {"observed": pd.DataFrame(), "pairs": pd.DataFrame()}
     try:
-        now_utc = datetime.now(timezone.utc)
-        doc = {
-            "city":          city,
-            "ts_epoch":      int(now_utc.timestamp()),
-            "logged_at":     now_utc,
-            "predicted_24h": round(float(aqi_24h),     2),
-            "predicted_48h": round(float(aqi_48h),     2),
-            "predicted_72h": round(float(aqi_72h),     2),
-            "observed_aqi":  round(float(current_aqi), 2),
-            "model_version": str(model_version),
-        }
-        get_db()["prediction_log"].insert_one(doc)
-        print(f"[inference] Logged prediction city={city} AQI={current_aqi:.0f} "
-              f"→ 24h={aqi_24h:.0f} 48h={aqi_48h:.0f} 72h={aqi_72h:.0f}")
+        db = get_db()
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=days)
+        cutoff_epoch = int(cutoff.timestamp())
+
+        logs = list(db["prediction_log"].find(
+            {"city": city, "ts_epoch": {"$gte": cutoff_epoch}},
+            {"_id": 0},
+        ).sort("ts_epoch", 1))
+
+        feats = list(db["aqi_features"].find(
+            {"city": city, "timestamp": {"$gte": cutoff}},
+            {"_id": 0, "timestamp": 1, "aqi": 1},
+        ).sort("timestamp", 1))
     except Exception as e:
-        print(f"[inference] Prediction logging failed (non-fatal): {e}")
+        print(f"[inference] load_forecast_trackrecord failed: {e}")
+        return empty
+
+    if not feats:
+        return empty
+    obs_df = pd.DataFrame(feats)
+    obs_df["timestamp"] = pd.to_datetime(obs_df["timestamp"], utc=True)
+    obs_df["aqi"] = pd.to_numeric(obs_df["aqi"], errors="coerce")
+    obs_df = obs_df.dropna(subset=["aqi"]).sort_values("timestamp").reset_index(drop=True)
+
+    if not logs or obs_df.empty:
+        return {"observed": obs_df, "pairs": pd.DataFrame()}
+
+    # Build (target_ts, horizon, predicted) rows from each logged forecast.
+    rows = []
+    for log in logs:
+        made_at = pd.to_datetime(log.get("logged_at"), utc=True, errors="coerce")
+        if pd.isna(made_at):
+            made_at = pd.to_datetime(log.get("ts_epoch"), unit="s", utc=True, errors="coerce")
+        if pd.isna(made_at):
+            continue
+        for h in (24, 48, 72):
+            val = log.get(f"predicted_{h}h")
+            if val is None:
+                continue
+            rows.append({"target_ts": made_at + pd.Timedelta(hours=h),
+                         "horizon": h, "predicted": float(val)})
+    if not rows:
+        return {"observed": obs_df, "pairs": pd.DataFrame()}
+
+    pred_df = pd.DataFrame(rows).sort_values("target_ts").reset_index(drop=True)
+
+    # Match each forecast to the observed AQI nearest its target time (±90 min).
+    pairs = pd.merge_asof(
+        pred_df, obs_df.rename(columns={"timestamp": "target_ts", "aqi": "observed"}),
+        on="target_ts", direction="nearest", tolerance=pd.Timedelta(minutes=90),
+    ).dropna(subset=["observed"]).reset_index(drop=True)
+
+    return {"observed": obs_df, "pairs": pairs}
 
 
 def load_prediction_log(city: str = DEFAULT_CITY, days: int = 7) -> pd.DataFrame:
-    """Fetch recent prediction log rows for the hindcast chart."""
+    """Raw prediction_log rows (kept for diagnostics / downstream use)."""
     try:
         cutoff = int(datetime.now(timezone.utc).timestamp()) - days * 86400
         cursor = get_db()["prediction_log"].find(
@@ -413,115 +171,65 @@ def load_prediction_log(city: str = DEFAULT_CITY, days: int = 7) -> pd.DataFrame
         df["timestamp"] = pd.to_datetime(df["ts_epoch"], unit="s", utc=True)
         return df.reset_index(drop=True)
     except Exception as e:
-        print(f"[inference] load_prediction_log failed (non-fatal): {e}")
+        print(f"[inference] load_prediction_log failed: {e}")
         return pd.DataFrame()
 
 
-# ─── SHAP data ────────────────────────────────────────────────────────────────
+# ─── SHAP values (Feature Importance tab) ──────────────────────────────────────
 
 def load_shap_data() -> dict:
-    """Load pre-computed SHAP values (cached).
-
-    Tries local file first (dev/training run). Falls back to extracting
-    shap_values.pkl from the champion's GridFS artifact ZIP (Render).
-    """
-    now = datetime.now(timezone.utc)
-    with _cache_lock:
-        if (
-            _SHAP_CACHE["data"] is not None
-            and _SHAP_CACHE["ts"] is not None
-            and (now - _SHAP_CACHE["ts"]).total_seconds() < _SHAP_CACHE_TTL
-        ):
-            return _SHAP_CACHE["data"]
-
-    data = {}
+    """Load precomputed SHAP values — local file first, then champion GridFS bundle."""
     if SHAP_PATH.exists():
-        with open(SHAP_PATH, "rb") as f:
-            data = pickle.load(f)
-    else:
         try:
-            meta = get_db()["model_metadata"].find_one({"model_name": "aqi_champion"})
-            if meta and meta.get("artifacts_gridfs_id"):
-                zip_bytes = get_gridfs().get(meta["artifacts_gridfs_id"]).read()
-                with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-                    if "shap_values.pkl" in zf.namelist():
-                        data = pickle.loads(zf.read("shap_values.pkl"))
+            with open(SHAP_PATH, "rb") as f:
+                return pickle.load(f)
         except Exception as e:
-            print(f"[inference] Could not load SHAP from MongoDB: {e}")
-
-    with _cache_lock:
-        _SHAP_CACHE["data"] = data
-        _SHAP_CACHE["ts"]   = now
-    return data
-
-
-# ─── Leaderboard metadata ─────────────────────────────────────────────────────
-
-def load_all_models_metadata() -> list[dict]:
-    """Fetch metrics for all registered models (for the leaderboard).
-
-    Single MongoDB query — no per-model downloads, no KNOWN_MODEL_NAMES loop.
-    """
-    now = datetime.now(timezone.utc)
-    with _cache_lock:
-        if (
-            _METADATA_CACHE["data"] is not None
-            and _METADATA_CACHE["ts"] is not None
-            and (now - _METADATA_CACHE["ts"]).total_seconds() < _METADATA_CACHE_TTL
-        ):
-            print("[inference] Returning cached leaderboard metadata")
-            return _METADATA_CACHE["data"]
+            print(f"[inference] Local SHAP load failed: {e}")
 
     try:
-        cursor = get_db()["model_metadata"].find(
-            {},
-            {"_id": 0, "artifacts_gridfs_id": 0},
-        )
+        meta = get_db()["model_metadata"].find_one({"model_name": "aqi_champion"})
+        if meta and meta.get("artifacts_gridfs_id"):
+            zip_bytes = get_gridfs().get(meta["artifacts_gridfs_id"]).read()
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                if "shap_values.pkl" in zf.namelist():
+                    return pickle.loads(zf.read("shap_values.pkl"))
+    except Exception as e:
+        print(f"[inference] Could not load SHAP from MongoDB: {e}")
+    return {}
+
+
+# ─── Leaderboard metadata ──────────────────────────────────────────────────────
+
+def load_all_models_metadata() -> list[dict]:
+    """Metrics for every registered model (for the leaderboard). Single query."""
+    try:
+        cursor = get_db()["model_metadata"].find({}, {"_id": 0, "artifacts_gridfs_id": 0})
         results = []
         for doc in cursor:
             if doc.get("model_name") == "aqi_champion":
-                continue  # champion is shown via promoted_from in the originating model row
+                continue  # shown via promoted_from on the originating model row
             results.append({
-                "name":        doc.get("model_name"),
-                "version":     doc.get("trained_at", "-"),
-                "rmse":        doc.get("rmse"),
-                "ioa":         doc.get("ioa"),
-                "skill_score": doc.get("skill_score"),
-                "oof_rmse":    doc.get("oof_rmse"),
-                "topsis_score":doc.get("topsis_score"),
-                "overfit":     bool(doc.get("overfit_flag", 0)),
-                "is_champion": bool(doc.get("is_champion", False)),
+                "name":         doc.get("model_name"),
+                "version":      doc.get("trained_at", "-"),
+                "rmse":         doc.get("rmse"),
+                "rmse_d1":      doc.get("rmse_d1"),
+                "rmse_d2":      doc.get("rmse_d2"),
+                "rmse_d3":      doc.get("rmse_d3"),
+                "ioa":          doc.get("ioa"),
+                "skill_score":  doc.get("skill_score"),
+                "oof_rmse":     doc.get("oof_rmse"),
+                "topsis_score": doc.get("topsis_score"),
+                "overfit":      bool(doc.get("overfit_flag", 0)),
+                "is_champion":  bool(doc.get("is_champion", False)),
             })
 
-        # Mark the promoted_from model as champion
         champ = get_db()["model_metadata"].find_one({"model_name": "aqi_champion"})
         if champ and champ.get("promoted_from"):
             for r in results:
                 if r["name"] == champ["promoted_from"]:
                     r["is_champion"] = True
 
-        data = results or [{"name": "No models registered yet", "version": "-"}]
+        return results or [{"name": "No models registered yet", "version": "-"}]
     except Exception as e:
         print(f"[inference] load_all_models_metadata failed: {e}")
         return [{"name": f"MongoDB unavailable: {e}", "version": "-"}]
-
-    with _cache_lock:
-        _METADATA_CACHE["data"] = data
-        _METADATA_CACHE["ts"]   = now
-    return data
-
-
-# ─── Background cache warm-up ─────────────────────────────────────────────────
-
-def _warm_cache():
-    try:
-        print("[inference] Background warm-up: loading leaderboard metadata...")
-        load_all_models_metadata()
-        print("[inference] Background warm-up: loading SHAP data...")
-        load_shap_data()
-        print("[inference] Background warm-up complete.")
-    except Exception as e:
-        print(f"[inference] Background warm-up error (non-fatal): {e}")
-
-
-threading.Thread(target=_warm_cache, daemon=True, name="inference-warmup").start()

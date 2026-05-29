@@ -65,14 +65,7 @@ else
     echo "[run_local]          Create it with: python3 -m venv venv && pip install -r requirements.txt"
 fi
 
-# ── Run with gunicorn (same as production) ───────────────────────────────────
-# --timeout 300  : matches Procfile — avoids worker kill during slow Hopsworks queries
-# --workers 1    : single worker shares the in-memory caches (important!)
-# --reload       : auto-restart on code changes (dev convenience)
-exec gunicorn \
-    --bind "0.0.0.0:${PORT}" \
-    --workers 1 \
-    --timeout 300 \
-    --reload \
-    --log-level info \
-    src.dashboard.app:server
+# ── Run the Streamlit dashboard (same entry point as Streamlit Cloud) ─────────
+exec streamlit run app.py \
+    --server.port "${PORT}" \
+    --server.address 0.0.0.0

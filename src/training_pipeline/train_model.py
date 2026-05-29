@@ -155,11 +155,17 @@ def _oof_rmse(estimator, X, Y, n_splits=N_SPLITS_OOF) -> float:
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 
-def _save_champion_oof_predictions(model, X_train, Y_train, df_train) -> None:
+def _save_champion_oof_predictions(
+    model, X_train, Y_train, df_train,
+    X_val=None, Y_val=None, df_val=None,
+    X_test=None, Y_test=None, df_test=None,
+) -> None:
     """Save per-sample OOF predictions for the champion model to MongoDB.
 
     These are read by the dashboard's hindcast chart (Panel B) to overlay
     model predictions on observed AQI without any data leakage.
+    Val and test predictions are appended after OOF (model trained on X_train
+    only, so these are also leakage-free).
     """
     from src.db import get_db
     tscv = TimeSeriesSplit(n_splits=N_SPLITS_OOF)
@@ -180,11 +186,28 @@ def _save_champion_oof_predictions(model, X_train, Y_train, df_train) -> None:
         docs.append({"timestamp": ts, "city": city,
                      "predicted": float(pred), "observed": float(obs)})
 
+    # Refit on full training set, then predict val and test (leakage-free)
+    model.fit(X_train, Y_train)
+    for X_extra, Y_extra, df_extra in (
+        (X_val, Y_val, df_val),
+        (X_test, Y_test, df_test),
+    ):
+        if X_extra is None or df_extra is None:
+            continue
+        p = np.asarray(model.predict(X_extra))
+        preds = (p[:, 0] if p.ndim == 2 else p).tolist()
+        for i, (pred, obs) in enumerate(zip(preds, Y_extra[:, 0].tolist())):
+            ts = df_extra["timestamp"].iloc[i]
+            if hasattr(ts, "to_pydatetime"):
+                ts = ts.to_pydatetime()
+            docs.append({"timestamp": ts, "city": city,
+                         "predicted": float(pred), "observed": float(obs)})
+
     if docs:
         col = get_db()["oof_predictions"]
         col.delete_many({})
         col.insert_many(docs)
-        print(f"[train] Saved {len(docs)} OOF prediction rows to MongoDB")
+        print(f"[train] Saved {len(docs)} OOF+val+test prediction rows to MongoDB")
 
 
 def train_classical(X_train, Y_train, X_test, Y_test, y_persistence) -> list[dict]:
@@ -552,8 +575,12 @@ def main():
         _champ_name = (_champ_meta or {}).get("promoted_from")
         _champ_result = next((r for r in sklearn_results if r["name"] == _champ_name), None)
         if _champ_result:
+            n_train = len(X_train)
+            n_val   = len(X_val)
             _save_champion_oof_predictions(
-                _champ_result["model"], X_train, Y_train, df.iloc[:len(X_train)]
+                _champ_result["model"], X_train, Y_train, df.iloc[:n_train],
+                X_val=X_val, Y_val=Y_val, df_val=df.iloc[n_train:n_train + n_val].reset_index(drop=True),
+                X_test=X_test, Y_test=Y_test, df_test=df.iloc[n_train + n_val:].reset_index(drop=True),
             )
         else:
             print(f"[train] OOF save skipped — champion '{_champ_name}' not found in results")

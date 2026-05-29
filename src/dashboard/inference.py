@@ -237,14 +237,29 @@ def predict_3day(
 
     Always returns a valid dict — never raises.
     """
+    # Fetch history first so it can serve as AQICN fallback when the station is down.
+    try:
+        history = get_recent_features(city=city, n=72)
+    except Exception as e:
+        print(f"[inference] get_recent_features failed: {e}")
+        history = pd.DataFrame()
+
     current_aqi = 0
     raw = {}
     try:
         raw = fetch_current(city=city, lat=lat, lon=lon)
-        # Use AQICN's already-computed AQI directly; fall back to PM2.5 conversion
-        # only if the API didn't return one. pm25_to_aqi(pm25_from_openweather)
-        # causes a slight mismatch because OpenWeather and AQICN use different sensors.
-        current_aqi = float(raw.get("aqi_from_api") or 0) or pm25_to_aqi(raw.get("pm25", 0))
+        aqi_from_api = float(raw.get("aqi_from_api") or 0)
+        if aqi_from_api > 0:
+            current_aqi = aqi_from_api
+        elif not history.empty and "aqi" in history.columns:
+            # AQICN station is down or returned 0 — use last known stored reading.
+            # Do NOT fall back to pm25_to_aqi(openweather_pm25): OpenWeather PM2.5
+            # is systematically inflated for Karachi (~73 µg/m³ vs real ~15 µg/m³),
+            # which produces a false AQI of ~161.
+            current_aqi = float(history["aqi"].iloc[-1])
+            print("[inference] AQICN returned 0 — using last stored AQI as current")
+        else:
+            current_aqi = 0
     except Exception as e:
         print(f"[inference] fetch_current failed: {e}")
         return {
@@ -253,12 +268,6 @@ def predict_3day(
             "lower_24h": 0, "upper_24h": 0,
             "error": f"Could not fetch live data: {e}",
         }
-
-    try:
-        history = get_recent_features(city=city, n=72)
-    except Exception as e:
-        print(f"[inference] get_recent_features failed: {e}")
-        history = pd.DataFrame()
 
     try:
         ts  = datetime.now(timezone.utc)

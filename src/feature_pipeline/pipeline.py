@@ -71,9 +71,8 @@ def run_pipeline(city: str = DEFAULT_CITY, lat: float = DEFAULT_LAT, lon: float 
     # re-fit on already-scaled data during daily training runs.
     insert_features(df)
 
-    # 4b. Promote current AQICN AQI as the training target for rows 24/48/72h ago.
-    # Those past rows were stored with null targets (future AQI unknown at the time).
-    # Now that 24h/48h/72h has elapsed, the current reading IS the ground truth.
+    # 4b. Promote current pm25-derived AQI as training target for rows 24/48/72h ago.
+    # row["aqi"] is now always pm25_to_aqi(openweather_pm25) — consistent with backfill.
     _fill_past_targets(city, ts, float(row["aqi"]))
 
     # 5. Drift check

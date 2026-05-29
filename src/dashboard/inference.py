@@ -248,18 +248,13 @@ def predict_3day(
     raw = {}
     try:
         raw = fetch_current(city=city, lat=lat, lon=lon)
+        # aqi_from_api is now pm25_to_aqi(openweather_pm25) — always reliable.
+        # Falls back to pm25 from the raw dict if fetch_current somehow returns 0.
         aqi_from_api = float(raw.get("aqi_from_api") or 0)
         if aqi_from_api > 0:
             current_aqi = aqi_from_api
-        elif not history.empty and "aqi" in history.columns:
-            # AQICN station is down or returned 0 — use last known stored reading.
-            # Do NOT fall back to pm25_to_aqi(openweather_pm25): OpenWeather PM2.5
-            # is systematically inflated for Karachi (~73 µg/m³ vs real ~15 µg/m³),
-            # which produces a false AQI of ~161.
-            current_aqi = float(history["aqi"].iloc[-1])
-            print("[inference] AQICN returned 0 — using last stored AQI as current")
         else:
-            current_aqi = 0
+            current_aqi = pm25_to_aqi(raw.get("pm25", 0))
     except Exception as e:
         print(f"[inference] fetch_current failed: {e}")
         return {

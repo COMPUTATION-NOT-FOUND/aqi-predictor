@@ -219,21 +219,28 @@ def fetch_current(
     """
     Merge AQICN AQI reading with OpenWeather concentrations + meteorology.
 
-    AQI source  : AQICN  (already correctly computed, no double-conversion)
+    AQI source  : OpenWeather PM2.5 → pm25_to_aqi() (US EPA formula)
     PM2.5 source: OpenWeather /air_pollution (true µg/m³ concentrations)
     Weather     : OpenWeather /weather (temperature, wind, etc.)
+
+    NOTE: AQICN's d.aqi composite value is fetched but NOT used as the AQI.
+    Karachi testing showed AQICN returns 161 while OpenWeather PM2.5=16.6 µg/m³
+    → US EPA AQI=61, which matches independent monitoring sources.  AQICN
+    appears to use a different standard or station location for this city.
     """
+    from src.feature_pipeline.feature_engineering import pm25_to_aqi as _pm25_to_aqi
+
     aqicn_data  = fetch_aqicn(city)
     weather     = fetch_openweather(lat, lon)
     pollutants  = fetch_openweather_air_pollution(lat, lon)
 
-    # Start with the AQICN AQI (correctly computed), then fill concentrations
-    # from OpenWeather (true µg/m³), then add weather.
     merged = {**aqicn_data, **weather, **pollutants}
 
-    # Use aqi_raw directly as the AQI — do NOT call pm25_to_aqi(pm25) again
-    # in build_feature_row().  Mark with a flag so feature_engineering can check.
-    merged["aqi_from_api"] = merged["aqi_raw"]
+    # Compute AQI from OpenWeather PM2.5 (US EPA formula) — consistent with
+    # the backfill pipeline and with what independent monitoring sources report.
+    # Store raw AQICN value separately for diagnostics only.
+    merged["aqi_aqicn_raw"] = merged.get("aqi_raw", 0)
+    merged["aqi_from_api"]  = _pm25_to_aqi(merged.get("pm25", 0))
 
     return merged
 

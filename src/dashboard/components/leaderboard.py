@@ -69,7 +69,7 @@ def leaderboard_dataframe(models_metadata: list[dict]):
     if "is_champion" not in df.columns:
         df["is_champion"] = False
     df["is_champion"] = df["is_champion"].fillna(False).astype(bool)
-    df["status"] = df["is_champion"].map(lambda x: "🏆 CHAMPION" if x else "challenger")
+    df["status"] = df["is_champion"].map(lambda x: "CHAMPION" if x else "challenger")
     if "overfit" not in df.columns:
         df["overfit"] = False
 
@@ -124,7 +124,7 @@ def build_radar_chart(models_metadata: list[dict]) -> go.Figure | None:
     for i, (_, row) in enumerate(top5.iterrows()):
         vals = [float(row[c]) for c in axes_norm]
         vals += [vals[0]]
-        label = ("🏆 " if row.get("is_champion") else "") + f"{row['name']} v{row['version']}"
+        label = ("★ " if row.get("is_champion") else "") + f"{row['name']} v{row['version']}"
         fig.add_trace(go.Scatterpolar(
             r=vals, theta=axes_labels + [axes_labels[0]], fill="toself", name=label,
             line=dict(color=colors[i % len(colors)], width=2), opacity=0.85,

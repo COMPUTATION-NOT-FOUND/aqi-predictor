@@ -38,7 +38,7 @@ from src.dashboard.components.leaderboard import (
 from src.dashboard.components.shap_plot import build_shap_bar
 from src.dashboard.components.ablation_tab import build_ablation_charts
 
-st.set_page_config(page_title="AQI Predictor", page_icon="🌫️", layout="wide")
+st.set_page_config(page_title="AQI Predictor", page_icon=":material/air:", layout="wide")
 
 _PLOTLY = {"width": "stretch", "config": {"displayModeBar": False}}
 
@@ -104,9 +104,9 @@ def c_ablation_fig():
 # ─── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.title("🌫️ AQI Predictor")
+    st.title(":material/air: AQI Predictor")
     st.caption(f"City: **{DEFAULT_CITY.title()}** · forecasts refresh hourly")
-    if st.button("🔄 Refresh data", width="stretch"):
+    if st.button("Refresh data", icon=":material/refresh:", width="stretch"):
         st.cache_data.clear()
         st.rerun()
     st.markdown("---")
@@ -120,9 +120,12 @@ with st.sidebar:
 
 city = DEFAULT_CITY
 
-tab_forecast, tab_board, tab_ablation, tab_shap = st.tabs(
-    ["📈 Live Forecast", "🏆 Leaderboard", "🧪 Ablation Study", "🔍 Feature Importance"]
-)
+tab_forecast, tab_board, tab_ablation, tab_shap = st.tabs([
+    ":material/insights: Live Forecast",
+    ":material/leaderboard: Leaderboard",
+    ":material/science: Ablation Study",
+    ":material/query_stats: Feature Importance",
+])
 
 
 # ─── Tab 1 — Live Forecast ─────────────────────────────────────────────────────
@@ -137,14 +140,16 @@ with tab_forecast:
     lo24, hi24 = pred.get("lower_24h", 0), pred.get("upper_24h", 0)
 
     if pred.get("error"):
-        st.warning(f"⏳ {pred['error']}")
+        st.warning(pred["error"], icon=":material/hourglass_empty:")
     elif pred.get("stale"):
         age_h = (pred.get("age_minutes") or 0) / 60.0
-        st.info(f"⚠️ Latest forecast is {age_h:.1f}h old — the hourly pipeline may be delayed.")
+        st.info(f"Latest forecast is {age_h:.1f}h old — the hourly pipeline may be delayed.",
+                icon=":material/schedule:")
 
     alert = alert_for(max(current, a24, a48, a72))
     if alert:
-        st.error(f"🚨 **HAZARDOUS AIR QUALITY — {alert['label']} (AQI {alert['aqi']:.0f})**  \n{alert['message']}")
+        st.error(f"**HAZARDOUS AIR QUALITY — {alert['label']} (AQI {alert['aqi']:.0f})**  \n{alert['message']}",
+                 icon=":material/warning:")
 
     g1, g2, g3, g4 = st.columns(4)
     for col, val, label in [(g1, current, "Current AQI"), (g2, a24, "24h Forecast"),
@@ -152,7 +157,7 @@ with tab_forecast:
         with col:
             st.plotly_chart(build_gauge(val, label), **_PLOTLY)
 
-    with st.expander("ℹ️ How to read these charts"):
+    with st.expander("How to read these charts", icon=":material/info:"):
         st.markdown(
             "- **Observed AQI** — PM2.5-derived ground truth (24h-mean, EPA scale).\n"
             "- **Forecast Track Record** — past forecasts the system actually made, scored "
@@ -187,7 +192,7 @@ with tab_board:
     df, champion = leaderboard_dataframe(metadata)
 
     if champion:
-        st.markdown(f"#### 🏆 Champion — {champion.get('name', '—')}")
+        st.markdown(f"#### :material/workspace_premium: Champion — {champion.get('name', '—')}")
         m = st.columns(5)
         m[0].metric("TOPSIS", _fmt(champion.get("topsis_score")))
         m[1].metric("RMSE", _fmt(champion.get("rmse"), 1))
@@ -195,7 +200,7 @@ with tab_board:
         m[3].metric("IoA", _fmt(champion.get("ioa")))
         m[4].metric("Skill", _fmt(champion.get("skill_score")))
 
-    with st.expander("📖 Metric definitions & standards"):
+    with st.expander("Metric definitions & standards", icon=":material/menu_book:"):
         st.dataframe(pd.DataFrame(METRIC_GLOSSARY), width="stretch", hide_index=True)
 
     radar = build_radar_chart(metadata)

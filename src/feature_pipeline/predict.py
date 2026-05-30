@@ -32,7 +32,15 @@ from src.feature_pipeline.feature_engineering import (
     build_feature_row, apply_scaler, pm25_to_aqi, pm25_mean_to_aqi,
 )
 from src.feature_pipeline.store_features import fetch_recent
-from src.training_pipeline.wrappers import FirstOutputWrapper  # noqa: F401 — for calibrator unpickling
+# These imports make the wrapper classes resolvable when unpickling champion
+# artifacts. They cover both module paths a pickle may reference:
+#   - src.training_pipeline.wrappers.* (models trained after the wrappers refactor)
+#   - __main__.*  (older artifacts pickled while train_model.py ran as a script —
+#     since predict.py also runs as __main__, importing the names here binds them
+#     into __main__ so the old pickle resolves too).
+from src.training_pipeline.wrappers import (  # noqa: F401
+    FirstOutputWrapper, WeightedVoter, KerasWrapper,
+)
 
 _HISTORY_ROWS = 200   # cover the 168h lag window plus headroom
 
@@ -46,7 +54,9 @@ def load_champion():
         print("[predict] No champion artifacts in MongoDB.")
         return None, None, None, None, None
 
-    version = meta.get("trained_at", "unknown")
+    # The champion doc carries promoted_from/promoted_at (not trained_at).
+    version = (meta.get("promoted_from") or meta.get("trained_at")
+               or meta.get("promoted_at") or "champion")
     feature_cols = meta.get("feature_cols")   # may also live in the ZIP
     model = scaler = calibrator = None
 

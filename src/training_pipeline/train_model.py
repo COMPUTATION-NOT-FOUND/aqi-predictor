@@ -53,7 +53,11 @@ from src.training_pipeline.distillation import distill
 from src.training_pipeline.conformal import calibrate
 from src.training_pipeline.ablation_features import run_ablation
 from src.training_pipeline.register_model import register_all
-from src.training_pipeline.wrappers import FirstOutputWrapper as _FirstOutputWrapper
+from src.training_pipeline.wrappers import (
+    FirstOutputWrapper as _FirstOutputWrapper,
+    WeightedVoter,
+    KerasWrapper,
+)
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -67,23 +71,8 @@ N_SPLITS_OOF = 3
 SHAP_PATH    = Path(__file__).parent.parent.parent / "shap_values.pkl"
 
 
-class WeightedVoter:
-    def __init__(self, models, weights):
-        self.models  = models
-        self.weights = weights
-    def fit(self, X, Y):
-        for m in self.models:
-            m.fit(X, Y)
-        return self
-    def predict(self, X):
-        preds = np.stack([m.predict(X) for m in self.models], axis=0)
-        return np.einsum("i,ijk->jk", self.weights, preds)
-
-
-class KerasWrapper:
-    def __init__(self, model): self.model = model
-    def predict(self, X): return self.model.predict(X, verbose=0)
-
+# WeightedVoter and KerasWrapper now live in src/training_pipeline/wrappers.py so
+# champion artifacts that contain them can be un-pickled by predict.py / the dashboard.
 
 
 # ─── Data Preparation ─────────────────────────────────────────────────────────

@@ -19,6 +19,7 @@ from src.feature_pipeline.feature_engineering import (
 )
 from src.feature_pipeline.store_features import insert_features, fetch_recent
 from src.feature_pipeline.drift_monitor import check_drift
+from src.feature_pipeline.sanitize import clean_raw_inputs, has_valid_pm25, finalize_feature_row
 
 
 def _fill_past_targets(city: str, current_ts: datetime, current_aqi: float) -> None:
@@ -44,8 +45,12 @@ def _fill_past_targets(city: str, current_ts: datetime, current_aqi: float) -> N
 def run_pipeline(city: str = DEFAULT_CITY, lat: float = DEFAULT_LAT, lon: float = DEFAULT_LON):
     print(f"[pipeline] Running feature pipeline for '{city}' at {datetime.now(timezone.utc).isoformat()}")
 
-    # 1. Fetch raw data
-    raw = fetch_current(city=city, lat=lat, lon=lon)
+    # 1. Fetch raw data and clamp to physical ranges
+    raw = clean_raw_inputs(fetch_current(city=city, lat=lat, lon=lon))
+
+    if not has_valid_pm25(raw):
+        print("[pipeline] No valid PM2.5 this run (API outage?) — skipping insert to avoid poisoning targets")
+        return None
 
     # 2. Fetch recent history for lag/rolling features.
     # Window must cover the longest lag (168h) plus headroom so 72h/168h lags populate.
@@ -71,6 +76,7 @@ def run_pipeline(city: str = DEFAULT_CITY, lat: float = DEFAULT_LAT, lon: float 
 
     # 3. Build feature row (includes aqi via build_feature_row → aqi_from_api 24h mean)
     row = build_feature_row(raw, history, ts, forecast=forecast)
+    row = finalize_feature_row(row)
 
     df = pd.DataFrame([row])
 

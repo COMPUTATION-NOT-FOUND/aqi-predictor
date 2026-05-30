@@ -22,6 +22,7 @@ from src.dashboard.inference import (
     load_latest_prediction,
     get_recent_features,
     load_forecast_trackrecord,
+    load_oof_predictions,
     load_all_models_metadata,
     load_shap_data,
 )
@@ -30,6 +31,7 @@ from src.dashboard.components.gauge import build_gauge
 from src.dashboard.components.forecast_chart import (
     build_ground_truth_chart,
     build_trackrecord_chart,
+    build_hindcast_chart,
     build_live_forecast_chart,
 )
 from src.dashboard.components.leaderboard import (
@@ -84,6 +86,11 @@ def c_history(city: str) -> pd.DataFrame:
 @st.cache_data(ttl=600, show_spinner=False)
 def c_trackrecord(city: str) -> dict:
     return load_forecast_trackrecord(city)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def c_oof(city: str) -> pd.DataFrame:
+    return load_oof_predictions(city)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -170,6 +177,9 @@ with tab_forecast:
 
     st.subheader("Forecast track record — predicted vs observed")
     st.plotly_chart(build_trackrecord_chart(track), **_PLOTLY)
+
+    st.subheader("Champion hindcast — model predictions across history")
+    st.plotly_chart(build_hindcast_chart(history, c_oof(city)), **_PLOTLY)
 
     st.subheader("Live forecast — next 72 hours")
     st.plotly_chart(

@@ -157,6 +157,21 @@ def load_forecast_trackrecord(city: str = DEFAULT_CITY, days: int = 14) -> dict:
     return {"observed": obs_df, "pairs": pairs}
 
 
+def load_oof_predictions(city: str = DEFAULT_CITY) -> pd.DataFrame:
+    """Out-of-fold predictions of the current champion across historical dates.
+
+    Written by the training pipeline (`_save_champion_oof_predictions`), refreshed on
+    every champion promotion. Leakage-free: the champion never saw these rows during
+    the fold it was scored on. Columns: timestamp, predicted, observed.
+    """
+    try:
+        from src.feature_pipeline.store_features import fetch_oof_predictions
+        return fetch_oof_predictions(city)
+    except Exception as e:
+        print(f"[inference] load_oof_predictions failed: {e}")
+        return pd.DataFrame()
+
+
 def load_prediction_log(city: str = DEFAULT_CITY, days: int = 7) -> pd.DataFrame:
     """Raw prediction_log rows (kept for diagnostics / downstream use)."""
     try:

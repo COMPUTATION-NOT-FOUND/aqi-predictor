@@ -22,7 +22,7 @@ DEFAULT_LAT     = float(os.getenv("DEFAULT_LAT", "24.8607"))   # Karachi latitud
 DEFAULT_LON     = float(os.getenv("DEFAULT_LON", "67.0011"))   # Karachi longitude
 
 # ─── Pipeline Config ──────────────────────────────────────────────────────────
-BACKFILL_DAYS        = int(os.getenv("BACKFILL_DAYS", "180"))   # FILL IN: history depth in days
+BACKFILL_DAYS        = int(os.getenv("BACKFILL_DAYS", "365"))   # one seasonal cycle; set BACKFILL_DAYS=730 env var for one-time 2yr re-seed
 FORECAST_HOURS       = [24, 48, 72]                             # 3-day forecast targets
 
 # ─── Champion-Challenger ──────────────────────────────────────────────────────

@@ -111,7 +111,8 @@ def _save_champion_artifacts(model, metrics: dict, tags: dict,
         content_type="application/zip",
     )
 
-    doc = {**metrics, **tags, "model_name": "aqi_champion", "artifacts_gridfs_id": file_id}
+    doc = {**metrics, **tags, "model_name": "aqi_champion",
+           "artifacts_gridfs_id": file_id, "residual_target": True}
     if feature_cols is not None:
         doc["feature_cols"] = list(feature_cols)
     get_db()["model_metadata"].update_one(

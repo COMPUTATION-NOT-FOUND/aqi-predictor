@@ -181,7 +181,10 @@ FORECAST_LEAD_MAP = {
 
 def forecast_lead_cols(horizons=tuple(FORECAST_HOURS)) -> list[str]:
     """Column names produced by the forecast_leads group, in a stable order."""
-    return [f"{prefix}_t{h}" for h in horizons for prefix in FORECAST_LEAD_MAP.values()]
+    return (
+        [f"{prefix}_t{h}" for h in horizons for prefix in FORECAST_LEAD_MAP.values()]
+        + [f"aqi_fc_t{h}" for h in horizons]
+    )
 
 
 def compute_forecast_lead_features(forecast: dict, horizons=tuple(FORECAST_HOURS)) -> dict:
@@ -197,6 +200,7 @@ def compute_forecast_lead_features(forecast: dict, horizons=tuple(FORECAST_HOURS
         for raw_key, prefix in FORECAST_LEAD_MAP.items():
             val = fh.get(raw_key, 0.0)
             row[f"{prefix}_t{h}"] = float(val) if val is not None else 0.0
+        row[f"aqi_fc_t{h}"] = float(pm25_to_aqi(fh.get("pm25_fc", 0.0)))
     return row
 
 

@@ -79,6 +79,7 @@ def xgb_suggest(trial: optuna.Trial) -> dict:
         "reg_lambda":       trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
         "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
         "gamma":            trial.suggest_float("gamma", 0.0, 5.0),
+        "max_delta_step":   trial.suggest_int("max_delta_step", 0, 5),
     }
 
 
@@ -112,7 +113,7 @@ OPTUNA_MODELS = [
     {
         "name":    "XGBoost",
         "factory": lambda params: MultiOutputRegressor(XGBRegressor(
-            objective="reg:pseudohubererror", random_state=42,
+            objective="reg:squarederror", random_state=42,
             verbosity=0, **params,
         ), n_jobs=1),
         "suggest": xgb_suggest,

@@ -137,8 +137,19 @@ def backfill(
     start_dt = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
     end_dt   = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
 
-    # Fetch pollutant history from OpenWeather Air Pollution History API
-    raw_rows = fetch_historical_openweather(lat, lon, int(start_dt.timestamp()), int(end_dt.timestamp()))
+    # Fetch pollutant history from OpenWeather Air Pollution History API in 180-day
+    # chunks to avoid truncation or rate-limiting on long date ranges.
+    def _fetch_chunked(lat, lon, unix_start, unix_end, chunk_days=180):
+        rows, step = [], chunk_days * 86400
+        s = unix_start
+        while s < unix_end:
+            e = min(s + step, unix_end)
+            rows.extend(fetch_historical_openweather(lat, lon, s, e))
+            time.sleep(1)
+            s = e
+        return rows
+
+    raw_rows = _fetch_chunked(lat, lon, int(start_dt.timestamp()), int(end_dt.timestamp()))
     if not raw_rows:
         print("[backfill] No data returned from OpenWeather history API")
         return pd.DataFrame()
@@ -146,6 +157,7 @@ def backfill(
     df_raw = pd.DataFrame(raw_rows)
     df_raw["timestamp"] = pd.to_datetime(df_raw["timestamp"])
     df_raw = df_raw.set_index("timestamp").sort_index()
+    df_raw = df_raw[~df_raw.index.duplicated(keep="last")]
 
     # Fetch historical weather from Open-Meteo (free, no API key needed)
     print("[backfill] Fetching historical weather from Open-Meteo...")
@@ -175,7 +187,7 @@ def backfill(
     _LEAD_SOURCE = {
         "temperature": "temperature", "humidity": "humidity", "pressure": "pressure",
         "wind_speed": "wind_speed", "cloud_cover": "cloud_cover",
-        "precipitation_1h": "precipitation_1h", "pm25_fc": "pm25",
+        "precipitation_1h": "precipitation_1h", "pm25_fc": "pm25_24h",
     }
 
     for ts, raw in df_imputed.iterrows():

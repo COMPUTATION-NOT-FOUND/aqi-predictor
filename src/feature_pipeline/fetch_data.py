@@ -314,9 +314,11 @@ def fetch_forecast(
                       "cloud_cover", "precipitation_1h"]:
                 if c in wx.columns:
                     feat[c] = float(wrow[c])
-        arow = _nearest(aq, target)
-        if arow is not None and "pm25_fc" in aq.columns:
-            feat["pm25_fc"] = float(arow["pm25_fc"])
+        if not aq.empty and "pm25_fc" in aq.columns:
+            window_end   = pd.Timestamp(target)
+            window_start = window_end - pd.Timedelta(hours=24)
+            mask = (aq.index >= window_start) & (aq.index <= window_end)
+            feat["pm25_fc"] = float(aq.loc[mask, "pm25_fc"].mean()) if mask.any() else 0.0
         out[h] = feat
     return out
 

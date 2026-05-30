@@ -48,16 +48,17 @@ _HISTORY_ROWS = 200   # cover the 168h lag window plus headroom
 # ─── Champion loading ─────────────────────────────────────────────────────────
 
 def load_champion():
-    """Return (model, scaler, feature_cols, calibrator, version) from GridFS, or Nones."""
+    """Return (model, scaler, feature_cols, calibrator, version, residual_target) from GridFS, or Nones."""
     meta = get_db()["model_metadata"].find_one({"model_name": "aqi_champion"})
     if not meta or not meta.get("artifacts_gridfs_id"):
         print("[predict] No champion artifacts in MongoDB.")
-        return None, None, None, None, None
+        return None, None, None, None, None, False
 
     # The champion doc carries promoted_from/promoted_at (not trained_at).
     version = (meta.get("promoted_from") or meta.get("trained_at")
                or meta.get("promoted_at") or "champion")
     feature_cols = meta.get("feature_cols")   # may also live in the ZIP
+    residual_target = bool(meta.get("residual_target", False))
     model = scaler = calibrator = None
 
     zip_bytes = get_gridfs().get(meta["artifacts_gridfs_id"]).read()
@@ -67,7 +68,7 @@ def load_champion():
         if model_type == "keras":
             # Champion should never be Keras (excluded from eligibility), but guard anyway.
             print("[predict] Champion is Keras — not supported in the precompute step.")
-            return None, None, None, None, None
+            return None, None, None, None, None, False
         model = pickle.loads(zf.read("model.pkl"))
         if "scaler_bundle.pkl" in names:
             scaler = pickle.loads(zf.read("scaler_bundle.pkl"))
@@ -79,13 +80,13 @@ def load_champion():
             except Exception as e:
                 print(f"[predict] Could not load conformal calibrator: {e}")
 
-    return model, scaler, feature_cols, calibrator, version
+    return model, scaler, feature_cols, calibrator, version, residual_target
 
 
 # ─── Prediction ───────────────────────────────────────────────────────────────
 
 def run(city: str = DEFAULT_CITY, lat: float = DEFAULT_LAT, lon: float = DEFAULT_LON) -> dict | None:
-    model, scaler, feature_cols, calibrator, version = load_champion()
+    model, scaler, feature_cols, calibrator, version, residual_target = load_champion()
     if model is None or not feature_cols:
         print("[predict] Aborting — no usable champion model / feature_cols.")
         return None
@@ -114,7 +115,11 @@ def run(city: str = DEFAULT_CITY, lat: float = DEFAULT_LAT, lon: float = DEFAULT
 
     # 3. Predict (model is multi-output: 24/48/72h).
     preds = np.asarray(model.predict(X))[0]
+    print("[predict] raw preds:", [round(float(p), 2) for p in np.atleast_1d(preds)])
+    print("[predict] pm25_fc leads:", {h: round(row.get(f"pm25_fc_t{h}", 0), 1) for h in FORECAST_HOURS})
     preds = np.atleast_1d(preds)
+    if residual_target:
+        preds = preds + current_aqi
     horizon_aqi = [
         float(np.clip(preds[i] if i < len(preds) else preds[-1], 0, 500))
         for i in range(len(FORECAST_HOURS))

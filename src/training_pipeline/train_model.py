@@ -120,15 +120,18 @@ def load_and_split():
 
     X = df[feature_cols].values.astype(np.float64)
     X = np.where(np.isfinite(X), X, 0.0)
+    X = np.clip(X, -8, 8)
     Y = df[TARGET_COLS].values       # shape (n, 3) — raw AQI units
 
     X_train, Y_train = X[:n_train],               Y[:n_train]
     X_val,   Y_val   = X[n_train:n_train+n_val],  Y[n_train:n_train+n_val]
     X_test,  Y_test  = X[n_train+n_val:],         Y[n_train+n_val:]
-    aqi_test         = current_aqi_all[n_train+n_val:]   # raw current AQI for test rows
+    aqi_train = current_aqi_all[:n_train]
+    aqi_val   = current_aqi_all[n_train:n_train+n_val]
+    aqi_test  = current_aqi_all[n_train+n_val:]
 
     print(f"[train] Data split: train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
-    return X_train, Y_train, X_val, Y_val, X_test, Y_test, feature_cols, df, df_raw_train, aqi_test
+    return X_train, Y_train, X_val, Y_val, X_test, Y_test, feature_cols, df, df_raw_train, aqi_train, aqi_val, aqi_test
 
 
 def persistence_baseline(aqi_current_test, n_horizons: int = len(TARGET_COLS)) -> np.ndarray:
@@ -144,13 +147,22 @@ def persistence_baseline(aqi_current_test, n_horizons: int = len(TARGET_COLS)) -
 
 # ─── Training Helpers ─────────────────────────────────────────────────────────
 
-def _oof_rmse(estimator, X, Y, n_splits=N_SPLITS_OOF) -> float:
-    """Out-of-fold RMSE using TimeSeriesSplit (primary model selection metric)."""
-    tscv = TimeSeriesSplit(n_splits=n_splits)
+def _oof_rmse(estimator, X, Y, n_splits=N_SPLITS_OOF, offsets=None) -> float:
+    """Out-of-fold RMSE using TimeSeriesSplit (primary model selection metric).
+
+    When `offsets` (per-sample current AQI) is provided, the estimator is fit on
+    residuals (Y - offsets) and predictions are converted back to absolute AQI
+    before computing RMSE, so the metric stays in interpretable AQI units.
+    """
+    tscv = TimeSeriesSplit(n_splits=n_splits, gap=72)
     oof_preds, oof_true = [], []
     for tr, val in tscv.split(X):
-        estimator.fit(X[tr], Y[tr])
-        oof_preds.append(estimator.predict(X[val]))
+        Y_fit = Y[tr] - offsets[tr, None] if offsets is not None else Y[tr]
+        estimator.fit(X[tr], Y_fit)
+        preds = estimator.predict(X[val])
+        if offsets is not None:
+            preds = preds + offsets[val, None]
+        oof_preds.append(preds)
         oof_true.append(Y[val])
     y_pred = np.vstack(oof_preds).ravel()
     y_true = np.vstack(oof_true).ravel()
@@ -161,6 +173,7 @@ def _save_champion_oof_predictions(
     model, X_train, Y_train, df_train,
     X_val=None, Y_val=None, df_val=None,
     X_test=None, Y_test=None, df_test=None,
+    aqi_train=None, aqi_val=None, aqi_test=None,
 ) -> None:
     """Save per-sample OOF predictions for the champion model to MongoDB.
 
@@ -168,13 +181,18 @@ def _save_champion_oof_predictions(
     model predictions on observed AQI without any data leakage.
     Val and test predictions are appended after OOF (model trained on X_train
     only, so these are also leakage-free).
+    When aqi_* offset arrays are provided (residual-target models), predictions
+    are converted back to absolute AQI before storing.
     """
     from src.db import get_db
-    tscv = TimeSeriesSplit(n_splits=N_SPLITS_OOF)
+    tscv = TimeSeriesSplit(n_splits=N_SPLITS_OOF, gap=72)
     val_indices, preds_24h, obs_24h = [], [], []
     for tr, val in tscv.split(X_train):
-        model.fit(X_train[tr], Y_train[tr])
+        Y_fit = Y_train[tr] - aqi_train[tr, None] if aqi_train is not None else Y_train[tr]
+        model.fit(X_train[tr], Y_fit)
         p = np.asarray(model.predict(X_train[val]))
+        if aqi_train is not None:
+            p = p + aqi_train[val, None]
         val_indices.extend(val.tolist())
         preds_24h.extend((p[:, 0] if p.ndim == 2 else p).tolist())
         obs_24h.extend(Y_train[val, 0].tolist())
@@ -189,14 +207,17 @@ def _save_champion_oof_predictions(
                      "predicted": float(pred), "observed": float(obs)})
 
     # Refit on full training set, then predict val and test (leakage-free)
-    model.fit(X_train, Y_train)
-    for X_extra, Y_extra, df_extra in (
-        (X_val, Y_val, df_val),
-        (X_test, Y_test, df_test),
+    Y_train_fit = Y_train - aqi_train[:, None] if aqi_train is not None else Y_train
+    model.fit(X_train, Y_train_fit)
+    for X_extra, Y_extra, df_extra, aqi_extra in (
+        (X_val,  Y_val,  df_val,  aqi_val),
+        (X_test, Y_test, df_test, aqi_test),
     ):
         if X_extra is None or df_extra is None:
             continue
         p = np.asarray(model.predict(X_extra))
+        if aqi_extra is not None:
+            p = p + aqi_extra[:, None]
         preds = (p[:, 0] if p.ndim == 2 else p).tolist()
         for i, (pred, obs) in enumerate(zip(preds, Y_extra[:, 0].tolist())):
             ts = df_extra["timestamp"].iloc[i]
@@ -212,7 +233,8 @@ def _save_champion_oof_predictions(
         print(f"[train] Saved {len(docs)} OOF+val+test prediction rows to MongoDB")
 
 
-def train_classical(X_train, Y_train, X_test, Y_test, y_persistence) -> list[dict]:
+def train_classical(X_train, Y_train, X_test, Y_test, y_persistence,
+                    aqi_train=None, aqi_test=None) -> list[dict]:
     results = []
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment("aqi_model_training")
@@ -223,23 +245,30 @@ def train_classical(X_train, Y_train, X_test, Y_test, y_persistence) -> list[dic
         with mlflow.start_run(run_name=name):
             est = spec["estimator"]
 
-            # Tune hyperparams
+            # Tune hyperparams on residuals when offset arrays are available
+            Y_train_fit = Y_train - aqi_train[:, None] if aqi_train is not None else Y_train
             search = RandomizedSearchCV(
                 est, spec["param_dist"],
-                n_iter=15, cv=TimeSeriesSplit(n_splits=3),
+                n_iter=15, cv=TimeSeriesSplit(n_splits=3, gap=72),
                 scoring="neg_root_mean_squared_error",
                 n_jobs=-1, random_state=42, verbose=0,
             )
-            search.fit(X_train, Y_train)
+            search.fit(X_train, Y_train_fit)
             best_est = search.best_estimator_
             best_params = search.best_params_
 
-            # OOF RMSE (leakage-proof)
-            oof = _oof_rmse(best_est, X_train, Y_train)
-            best_est.fit(X_train, Y_train)   # refit on full train after OOF
+            # OOF RMSE in absolute AQI units (leakage-proof, gap=72 applied inside)
+            oof = _oof_rmse(best_est, X_train, Y_train, offsets=aqi_train)
 
-            train_preds = best_est.predict(X_train)
-            test_preds  = best_est.predict(X_test)
+            # Final refit with recency weighting
+            _w = np.linspace(0.5, 1.0, len(X_train))
+            best_est.fit(X_train, Y_train_fit, sample_weight=_w)
+
+            train_preds_raw = best_est.predict(X_train)
+            test_preds_raw  = best_est.predict(X_test)
+            # Convert residual predictions back to absolute AQI for metric reporting
+            train_preds = train_preds_raw + aqi_train[:, None] if aqi_train is not None else train_preds_raw
+            test_preds  = test_preds_raw  + aqi_test[:, None]  if aqi_test  is not None else test_preds_raw
 
             train_rmse = float(np.sqrt(mean_squared_error(Y_train.ravel(), train_preds.ravel())))
             metrics    = evaluate_all(Y_test, test_preds, y_persistence)
@@ -259,7 +288,8 @@ def train_classical(X_train, Y_train, X_test, Y_test, y_persistence) -> list[dic
     return results
 
 
-def train_optuna(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence) -> list[dict]:
+def train_optuna(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence,
+                 aqi_train=None, aqi_test=None) -> list[dict]:
     results = []
     mlflow.set_experiment("aqi_model_training")
 
@@ -267,16 +297,19 @@ def train_optuna(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence) 
         name = spec["name"]
         print(f"\n[train] === {name} (Optuna) ===")
         with mlflow.start_run(run_name=name):
+            Y_train_fit = Y_train - aqi_train[:, None] if aqi_train is not None else Y_train
 
             def objective(trial):
                 params = spec["suggest"](trial)
                 model  = spec["factory"](params)
-                tscv   = TimeSeriesSplit(n_splits=3)
+                tscv   = TimeSeriesSplit(n_splits=3, gap=72)
                 rmses  = []
                 for tr, val in tscv.split(X_train):
-                    model.fit(X_train[tr], Y_train[tr])
-                    preds = model.predict(X_train[val]).ravel()
-                    rmses.append(np.sqrt(mean_squared_error(Y_train[val].ravel(), preds)))
+                    model.fit(X_train[tr], Y_train_fit[tr])
+                    preds = model.predict(X_train[val])
+                    if aqi_train is not None:
+                        preds = preds + aqi_train[val, None]
+                    rmses.append(np.sqrt(mean_squared_error(Y_train[val].ravel(), preds.ravel())))
                 return float(np.mean(rmses))
 
             study = optuna.create_study(direction="minimize")
@@ -284,11 +317,17 @@ def train_optuna(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence) 
 
             best_params = study.best_params
             best_model  = spec["factory"](best_params)
-            oof         = _oof_rmse(best_model, X_train, Y_train)
-            best_model.fit(X_train, Y_train)
+            oof         = _oof_rmse(best_model, X_train, Y_train, offsets=aqi_train)
 
-            train_preds = best_model.predict(X_train)
-            test_preds  = best_model.predict(X_test)
+            # Final refit with recency weighting
+            _w = np.linspace(0.5, 1.0, len(X_train))
+            best_model.fit(X_train, Y_train_fit, sample_weight=_w)
+
+            train_preds_raw = best_model.predict(X_train)
+            test_preds_raw  = best_model.predict(X_test)
+            train_preds = train_preds_raw + aqi_train[:, None] if aqi_train is not None else train_preds_raw
+            test_preds  = test_preds_raw  + aqi_test[:, None]  if aqi_test  is not None else test_preds_raw
+
             train_rmse  = float(np.sqrt(mean_squared_error(Y_train.ravel(), train_preds.ravel())))
             metrics     = evaluate_all(Y_test, test_preds, y_persistence)
             metrics["oof_rmse"]    = oof
@@ -375,23 +414,28 @@ def train_lstm(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence) ->
         return {"name": "LSTM", "model": final_model, "metrics": metrics}
 
 
-def build_ensembles(results: list[dict], X_train, Y_train, X_test, Y_test, y_persistence) -> list[dict]:
+def build_ensembles(results: list[dict], X_train, Y_train, X_test, Y_test, y_persistence,
+                    aqi_train=None, aqi_test=None) -> list[dict]:
     """Build stacking + voting ensembles from the top classical/boosting models."""
     mlflow.set_experiment("aqi_model_training")
     sorted_r = sorted(results, key=lambda r: r["metrics"]["rmse"])
     top3     = sorted_r[:3]
+
+    Y_train_fit = Y_train - aqi_train[:, None] if aqi_train is not None else Y_train
 
     # Voting ensemble (1/RMSE weights)
     weights = [1.0 / max(r["metrics"]["rmse"], 1e-6) for r in top3]
     w_norm  = [w / sum(weights) for w in weights]
 
     voter = WeightedVoter([r["model"] for r in top3], w_norm)
-    voter.fit(X_train, Y_train)
-    test_preds = voter.predict(X_test)
+    voter.fit(X_train, Y_train_fit)
+    test_preds_raw = voter.predict(X_test)
+    test_preds = test_preds_raw + aqi_test[:, None] if aqi_test is not None else test_preds_raw
     v_metrics  = evaluate_all(Y_test, test_preds, y_persistence)
-    v_metrics["oof_rmse"] = _oof_rmse(voter, X_train, Y_train)
-    train_preds_v = voter.predict(X_train).ravel()
-    v_metrics["train_rmse"]  = float(np.sqrt(mean_squared_error(Y_train.ravel(), train_preds_v)))
+    v_metrics["oof_rmse"] = _oof_rmse(voter, X_train, Y_train, offsets=aqi_train)
+    train_preds_v_raw = voter.predict(X_train)
+    train_preds_v = train_preds_v_raw + aqi_train[:, None] if aqi_train is not None else train_preds_v_raw
+    v_metrics["train_rmse"]  = float(np.sqrt(mean_squared_error(Y_train.ravel(), train_preds_v.ravel())))
     v_metrics["overfit_flag"] = int(overfitting_flag(v_metrics["train_rmse"], v_metrics["rmse"]))
     ensemble_results = [{"name": "VotingEnsemble", "model": voter, "metrics": v_metrics}]
     print(f"[train] VotingEnsemble: RMSE={v_metrics['rmse']:.2f} | OOF={v_metrics['oof_rmse']:.2f} | IoA={v_metrics.get('ioa', 0):.3f}")
@@ -408,12 +452,14 @@ def build_ensembles(results: list[dict], X_train, Y_train, X_test, Y_test, y_per
             ),
             n_jobs=1,
         )
-        stacker.fit(X_train, Y_train)
-        stack_preds = stacker.predict(X_test)
+        stacker.fit(X_train, Y_train_fit)
+        stack_preds_raw = stacker.predict(X_test)
+        stack_preds = stack_preds_raw + aqi_test[:, None] if aqi_test is not None else stack_preds_raw
         st_metrics  = evaluate_all(Y_test, stack_preds, y_persistence)
-        st_metrics["oof_rmse"] = _oof_rmse(stacker, X_train, Y_train)
-        train_preds_s = stacker.predict(X_train).ravel()
-        st_metrics["train_rmse"]  = float(np.sqrt(mean_squared_error(Y_train.ravel(), train_preds_s)))
+        st_metrics["oof_rmse"] = _oof_rmse(stacker, X_train, Y_train, offsets=aqi_train)
+        train_preds_s_raw = stacker.predict(X_train)
+        train_preds_s = train_preds_s_raw + aqi_train[:, None] if aqi_train is not None else train_preds_s_raw
+        st_metrics["train_rmse"]  = float(np.sqrt(mean_squared_error(Y_train.ravel(), train_preds_s.ravel())))
         st_metrics["overfit_flag"] = int(overfitting_flag(st_metrics["train_rmse"], st_metrics["rmse"]))
         ensemble_results.append({"name": "StackingEnsemble", "model": stacker, "metrics": st_metrics})
         print(f"[train] StackingEnsemble: RMSE={st_metrics['rmse']:.2f} | OOF={st_metrics['oof_rmse']:.2f} | IoA={st_metrics.get('ioa', 0):.3f}")
@@ -481,7 +527,7 @@ def main():
     print(f"{'='*60}\n")
 
     # 1. Load data — scaler is fit inside load_and_split on raw training data
-    X_train, Y_train, X_val, Y_val, X_test, Y_test, feature_cols, df, df_raw_train, aqi_test = load_and_split()
+    X_train, Y_train, X_val, Y_val, X_test, Y_test, feature_cols, df, df_raw_train, aqi_train, aqi_val, aqi_test = load_and_split()
 
     # 2. Save drift baseline from RAW (unscaled) training distribution so it
     # matches the unscaled rows written by the hourly feature pipeline.
@@ -491,8 +537,8 @@ def main():
     y_pers = persistence_baseline(aqi_test)
 
     # 4. Train all models
-    classical_results = train_classical(X_train, Y_train, X_test, Y_test, y_pers)
-    optuna_results    = train_optuna(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_pers)
+    classical_results = train_classical(X_train, Y_train, X_test, Y_test, y_pers, aqi_train, aqi_test)
+    optuna_results    = train_optuna(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_pers, aqi_train, aqi_test)
     lstm_result       = train_lstm(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_pers)
     all_results       = classical_results + optuna_results + [lstm_result]
 
@@ -500,6 +546,7 @@ def main():
     ensemble_results  = build_ensembles(
         [r for r in all_results if r["name"] != "LSTM"],
         X_train, Y_train, X_test, Y_test, y_pers,
+        aqi_train=aqi_train, aqi_test=aqi_test,
     )
     all_results += ensemble_results
 
@@ -507,39 +554,58 @@ def main():
     # (Ridge, XGBoost, etc.) in-place, leaving them fit on an OOF subset instead
     # of the full training set.  Refit every sklearn model here so the state
     # saved to GridFS by register_all is always fit on 100% of X_train.
+    Y_train_res = Y_train - aqi_train[:, None]
+    _w_full = np.linspace(0.5, 1.0, len(X_train))
     for r in classical_results + optuna_results:
         if hasattr(r["model"], "fit"):
-            r["model"].fit(X_train, Y_train)
+            try:
+                r["model"].fit(X_train, Y_train_res, sample_weight=_w_full)
+            except TypeError:
+                r["model"].fit(X_train, Y_train_res)
 
-    # 6. Knowledge distillation — prefer LightGBM over CatBoost when available
-    _DISTILL_CANDIDATES = ("RandomForest", "XGBoost", "LightGBM", "CatBoost")
+    # 6. Knowledge distillation — use the 3 best non-Keras models as teachers
     top3 = sorted(
-        [r for r in all_results if r["name"] in _DISTILL_CANDIDATES],
+        [r for r in all_results if r["name"] not in ("LSTM", "DistilledMLP")],
         key=lambda r: r["metrics"]["rmse"],
     )[:3]
+    Y_val_res = Y_val - aqi_val[:, None]
     if len(top3) == 3:
+        # Teachers predict residuals; train student on residual targets too
         student = distill(
             teachers=[r["model"] for r in top3],
             teacher_rmses=[r["metrics"]["rmse"] for r in top3],
-            X_train=X_train, y_train=Y_train,
-            X_val=X_val, y_val=Y_val,
+            X_train=X_train, y_train=Y_train_res,
+            X_val=X_val, y_val=Y_val_res,
         )
 
         wrapped_student = KerasWrapper(student)
-        test_preds_s    = wrapped_student.predict(X_test)
+        test_preds_s_raw = wrapped_student.predict(X_test)
+        test_preds_s = test_preds_s_raw + aqi_test[:, None]
         s_metrics       = evaluate_all(Y_test, test_preds_s, y_pers)
         s_metrics["oof_rmse"] = s_metrics["rmse"]
         all_results.append({"name": "DistilledMLP", "model": wrapped_student, "metrics": s_metrics})
         print(f"[train] DistilledMLP: RMSE={s_metrics['rmse']:.2f}")
 
     # 7. Conformal prediction calibration (on primary target aqi_24h)
+    # The champion model predicts residuals; add aqi_val offset so calibration
+    # residuals (|pred_abs - true_abs|) are in correct absolute AQI units.
     best_non_lstm = sorted(
         [r for r in all_results if r["name"] not in ("LSTM", "DistilledMLP")],
         key=lambda r: r["metrics"]["rmse"],
     )[0]
 
     try:
-        calibrate(_FirstOutputWrapper(best_non_lstm["model"]), X_val, Y_val[:, 0])
+        class _ResidualToAbsWrapper:
+            def __init__(self, model, offsets):
+                self._m = model
+                self._off = offsets
+            def predict(self, X):
+                return np.asarray(self._m.predict(X))[:, 0] + self._off
+
+        calibrate(
+            _ResidualToAbsWrapper(_FirstOutputWrapper(best_non_lstm["model"]), aqi_val),
+            X_val, Y_val[:, 0],
+        )
     except Exception as e:
         print(f"[train] Conformal calibration skipped: {e}")
 
@@ -585,6 +651,7 @@ def main():
                 _champ_result["model"], X_train, Y_train, df.iloc[:n_train],
                 X_val=X_val, Y_val=Y_val, df_val=df.iloc[n_train:n_train + n_val].reset_index(drop=True),
                 X_test=X_test, Y_test=Y_test, df_test=df.iloc[n_train + n_val:].reset_index(drop=True),
+                aqi_train=aqi_train, aqi_val=aqi_val, aqi_test=aqi_test,
             )
         else:
             print(f"[train] OOF save skipped — champion '{_champ_name}' not found in results")

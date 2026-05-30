@@ -5,12 +5,11 @@ Steps:
 1. Fetch historical features from MongoDB
 2. Temporal train/val/test split (70/10/20)
 3. Fit + re-save RobustScaler on training data
-4. Train 12 classical + deep learning models with OOF + TimeSeriesSplit CV
+4. Train classical + boosting models with OOF + TimeSeriesSplit CV
 5. Build stacking and voting ensembles
-6. Distill best ensemble → lightweight student MLP
-7. Calibrate conformal prediction intervals
-8. Run feature ablation study
-9. Register all models with Champion-Challenger gate
+6. Calibrate conformal prediction intervals
+7. Run feature ablation study
+8. Register all models with Champion-Challenger gate
 """
 import os, warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -44,19 +43,15 @@ from src.config import MLFLOW_TRACKING_URI, FORECAST_HOURS
 from src.feature_pipeline.store_features import fetch_training_data
 from src.feature_pipeline.feature_engineering import fit_scaler, apply_scaler, FEATURE_GROUP_COLS
 from src.feature_pipeline.drift_monitor import save_baseline
-from src.training_pipeline.models import (
-    CLASSICAL_MODELS, OPTUNA_MODELS, build_lstm, lstm_suggest,
-)
+from src.training_pipeline.models import CLASSICAL_MODELS, OPTUNA_MODELS
 from sklearn.ensemble import StackingRegressor
 from src.training_pipeline.evaluate_model import evaluate_all, overfitting_flag
-from src.training_pipeline.distillation import distill
 from src.training_pipeline.conformal import calibrate
 from src.training_pipeline.ablation_features import run_ablation
 from src.training_pipeline.register_model import register_all
 from src.training_pipeline.wrappers import (
     FirstOutputWrapper as _FirstOutputWrapper,
     WeightedVoter,
-    KerasWrapper,
 )
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -66,14 +61,14 @@ for _logger in ["mlflow", "mlflow.models.model", "mlflow.sklearn", "mlflow.utils
                 "mlflow.tensorflow", "tensorflow", "absl"]:
     logging.getLogger(_logger).setLevel(logging.ERROR)
 
-TARGET_COLS   = [f"aqi_{h}h" for h in FORECAST_HOURS]
-N_SPLITS_OOF  = 2
-MAX_TRAIN_ROWS = int(os.getenv("MAX_TRAIN_ROWS", "8760"))  # ~1 year; covers full seasonal cycle
+TARGET_COLS    = [f"aqi_{h}h" for h in FORECAST_HOURS]
+N_SPLITS_OOF   = 2
+MAX_TRAIN_ROWS = int(os.getenv("MAX_TRAIN_ROWS", "8760"))   # ~1 year; covers full seasonal cycle
 SHAP_PATH    = Path(__file__).parent.parent.parent / "shap_values.pkl"
 
 
-# WeightedVoter and KerasWrapper now live in src/training_pipeline/wrappers.py so
-# champion artifacts that contain them can be un-pickled by predict.py / the dashboard.
+# WeightedVoter lives in src/training_pipeline/wrappers.py so champion artifacts
+# that contain it can be un-pickled by predict.py / the dashboard.
 
 
 # ─── Data Preparation ─────────────────────────────────────────────────────────
@@ -349,76 +344,6 @@ def train_optuna(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence,
     return results
 
 
-def train_lstm(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence) -> dict:
-    import optuna, tensorflow as tf
-    from tensorflow.keras.callbacks import EarlyStopping
-
-    mlflow.set_experiment("aqi_model_training")
-    n_outputs = Y_train.shape[1]
-
-    def objective(trial):
-        params  = lstm_suggest(trial)
-        seq_len = params["sequence_length"]
-        n_feat  = X_train.shape[1]
-
-        # Reshape to sequences
-        def to_seq(X, Y, seq):
-            xs = np.array([X[i:i+seq] for i in range(len(X)-seq)])
-            ys = Y[seq:]
-            return xs, ys
-
-        Xtr_s, Ytr_s = to_seq(X_train, Y_train, seq_len)
-        Xvl_s, Yvl_s = to_seq(X_val,   Y_val,   seq_len)
-        if len(Xtr_s) < 50:
-            return 999.0
-
-        model = build_lstm(
-            units=params["units"], dropout=params["dropout"],
-            learning_rate=params["learning_rate"],
-            sequence_length=seq_len, n_features=n_feat, n_outputs=n_outputs,
-        )
-        model.fit(
-            Xtr_s, Ytr_s, validation_data=(Xvl_s, Yvl_s),
-            epochs=50, batch_size=64, verbose=0,
-            callbacks=[EarlyStopping(patience=7, restore_best_weights=True)],
-        )
-        preds = model.predict(Xvl_s, verbose=0).ravel()
-        return float(np.sqrt(mean_squared_error(Yvl_s.ravel(), preds)))
-
-    with mlflow.start_run(run_name="LSTM"):
-        study = optuna.create_study(direction="minimize")
-        study.optimize(objective, n_trials=15, show_progress_bar=False)
-        best = study.best_params
-        seq_len = best["sequence_length"]
-
-        def to_seq(X, Y, seq):
-            return (np.array([X[i:i+seq] for i in range(len(X)-seq)]), Y[seq:])
-
-        Xtr_s, Ytr_s = to_seq(X_train, Y_train, seq_len)
-        Xte_s, Yte_s = to_seq(X_test,  Y_test,  seq_len)
-        final_model   = build_lstm(**best, n_features=X_train.shape[1], n_outputs=n_outputs)
-        final_model.fit(
-            Xtr_s, Ytr_s, epochs=100, batch_size=64, verbose=0,
-            callbacks=[EarlyStopping(patience=20, restore_best_weights=True)],
-        )
-        test_preds  = final_model.predict(Xte_s, verbose=0)
-        train_preds = final_model.predict(Xtr_s, verbose=0).ravel()
-        train_rmse  = float(np.sqrt(mean_squared_error(Ytr_s.ravel(), train_preds)))
-        metrics     = evaluate_all(Yte_s, test_preds)
-        metrics["oof_rmse"]    = metrics["rmse"]   # LSTM uses val set for OOF proxy
-        metrics["train_rmse"]  = train_rmse
-        metrics["overfit_flag"] = int(overfitting_flag(train_rmse, metrics["rmse"]))
-
-        mlflow.log_params(best)
-        mlflow.log_metrics(metrics)
-        lstm_path = "/tmp/lstm_model.keras"
-        final_model.save(lstm_path)
-        mlflow.tensorflow.log_model(final_model, name="model")
-
-        print(f"[train] LSTM: RMSE={metrics['rmse']:.2f}")
-        return {"name": "LSTM", "model": final_model, "metrics": metrics}
-
-
 def build_ensembles(results: list[dict], X_train, Y_train, X_test, Y_test, y_persistence,
                     aqi_train=None, aqi_test=None) -> list[dict]:
     """Build stacking + voting ensembles from the top classical/boosting models."""
@@ -544,12 +469,11 @@ def main():
     # 4. Train all models
     classical_results = train_classical(X_train, Y_train, X_test, Y_test, y_pers, aqi_train, aqi_test)
     optuna_results    = train_optuna(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_pers, aqi_train, aqi_test)
-    lstm_result       = train_lstm(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_pers)
-    all_results       = classical_results + optuna_results + [lstm_result]
+    all_results = classical_results + optuna_results
 
-    # 5. Ensembles (exclude LSTM from voting — shape mismatch)
+    # 5. Ensembles
     ensemble_results  = build_ensembles(
-        [r for r in all_results if r["name"] != "LSTM"],
+        all_results,
         X_train, Y_train, X_test, Y_test, y_pers,
         aqi_train=aqi_train, aqi_test=aqi_test,
     )
@@ -568,36 +492,10 @@ def main():
             except TypeError:
                 r["model"].fit(X_train, Y_train_res)
 
-    # 6. Knowledge distillation — use the 3 best non-Keras models as teachers
-    top3 = sorted(
-        [r for r in all_results if r["name"] not in ("LSTM", "DistilledMLP")],
-        key=lambda r: r["metrics"]["rmse"],
-    )[:3]
-    Y_val_res = Y_val - aqi_val[:, None]
-    if len(top3) == 3:
-        # Teachers predict residuals; train student on residual targets too
-        student = distill(
-            teachers=[r["model"] for r in top3],
-            teacher_rmses=[r["metrics"]["rmse"] for r in top3],
-            X_train=X_train, y_train=Y_train_res,
-            X_val=X_val, y_val=Y_val_res,
-        )
-
-        wrapped_student = KerasWrapper(student)
-        test_preds_s_raw = wrapped_student.predict(X_test)
-        test_preds_s = test_preds_s_raw + aqi_test[:, None]
-        s_metrics       = evaluate_all(Y_test, test_preds_s, y_pers)
-        s_metrics["oof_rmse"] = s_metrics["rmse"]
-        all_results.append({"name": "DistilledMLP", "model": wrapped_student, "metrics": s_metrics})
-        print(f"[train] DistilledMLP: RMSE={s_metrics['rmse']:.2f}")
-
-    # 7. Conformal prediction calibration (on primary target aqi_24h)
+    # 6. Conformal prediction calibration (on primary target aqi_24h)
     # The champion model predicts residuals; add aqi_val offset so calibration
     # residuals (|pred_abs - true_abs|) are in correct absolute AQI units.
-    best_non_lstm = sorted(
-        [r for r in all_results if r["name"] not in ("LSTM", "DistilledMLP")],
-        key=lambda r: r["metrics"]["rmse"],
-    )[0]
+    best_non_lstm = sorted(all_results, key=lambda r: r["metrics"]["rmse"])[0]
 
     try:
         class _ResidualToAbsWrapper:
@@ -626,19 +524,9 @@ def main():
     if ablation_deltas:
         _persist_ablation_overrides(ablation_deltas)
 
-    # 10. Register all + Champion-Challenger
-    # Keras-based models (LSTM, DistilledMLP) are registered for leaderboard
-    # comparison but excluded from champion promotion — the dashboard runs on
-    # Render without TensorFlow, so the champion must be sklearn-compatible.
-    KERAS_MODELS = {"LSTM", "DistilledMLP"}
-    sklearn_results = [r for r in all_results if r["name"] not in KERAS_MODELS]
-    keras_results   = [r for r in all_results if r["name"] in KERAS_MODELS]
-
-    # Register Keras models with a flag so they appear in leaderboard
-    for r in keras_results:
-        r["metrics"]["champion_eligible"] = 0  # informational only
-    register_all(sklearn_results + keras_results,
-                 champion_eligible_names={r["name"] for r in sklearn_results},
+    # 9. Register all + Champion-Challenger
+    register_all(all_results,
+                 champion_eligible_names={r["name"] for r in all_results},
                  feature_cols=feature_cols)
 
     # 11. Save champion OOF predictions for hindcast chart
@@ -648,7 +536,7 @@ def main():
             {"model_name": "aqi_champion"}, {"promoted_from": 1}
         )
         _champ_name = (_champ_meta or {}).get("promoted_from")
-        _champ_result = next((r for r in sklearn_results if r["name"] == _champ_name), None)
+        _champ_result = next((r for r in all_results if r["name"] == _champ_name), None)
         if _champ_result:
             n_train = len(X_train)
             n_val   = len(X_val)

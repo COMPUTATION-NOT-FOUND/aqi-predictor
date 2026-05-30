@@ -38,14 +38,15 @@ jobs:
           MONGODB_DB_NAME:     ${{ secrets.MONGODB_DB_NAME }}
         run: python src/backfill/fill_targets.py
 
-      - name: Run training pipeline (all 12 models + distillation + ablation + registration)
+      - name: Run training pipeline
         env:
           AQICN_API_KEY:       ${{ secrets.AQICN_API_KEY }}
           OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
           MONGODB_URI:         ${{ secrets.MONGODB_URI }}
           MONGODB_DB_NAME:     ${{ secrets.MONGODB_DB_NAME }}
           MLFLOW_TRACKING_URI: "mlruns"
-        run: python src/training_pipeline/train_model.py
+          PYTHONUNBUFFERED:    "1"
+        run: python -u src/training_pipeline/train_model.py
 
       - name: Upload MLflow artifacts
         uses: actions/upload-artifact@v4

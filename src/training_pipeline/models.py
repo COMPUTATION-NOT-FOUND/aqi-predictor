@@ -1,5 +1,5 @@
 """
-All 12 model definitions with their Optuna / RandomizedSearchCV search spaces.
+All model definitions with their Optuna / RandomizedSearchCV search spaces.
 Models are organized as (name, estimator, search_space, tuner_type).
 """
 import numpy as np
@@ -44,10 +44,12 @@ CLASSICAL_MODELS = [
     },
     {
         "name": "RandomForest",
-        "estimator": RandomForestRegressor(random_state=42, n_jobs=-1),
+        # n_jobs=1 here: RandomizedSearchCV(n_jobs=-1) already parallelises folds;
+        # setting both to -1 oversubscribes the 2-core free runner and slows things down.
+        "estimator": RandomForestRegressor(random_state=42, n_jobs=1),
         "tuner": "random",
         "param_dist": {
-            "n_estimators":      [50, 100, 200],
+            "n_estimators":      [50, 100, 150],
             "max_depth":         [8, 12, 16, None],
             "max_features":      ["sqrt", "log2"],
             "min_samples_leaf":  [3, 5, 10],
@@ -70,25 +72,23 @@ CLASSICAL_MODELS = [
 
 def xgb_suggest(trial: optuna.Trial) -> dict:
     return {
-        "n_estimators":     trial.suggest_int("n_estimators", 200, 800),
-        "max_depth":        trial.suggest_int("max_depth", 3, 10),
-        "learning_rate":    trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+        "n_estimators":     trial.suggest_int("n_estimators", 100, 400),
+        "max_depth":        trial.suggest_int("max_depth", 3, 8),
+        "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
         "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
         "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
         "reg_alpha":        trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
         "reg_lambda":       trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
         "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
         "gamma":            trial.suggest_float("gamma", 0.0, 5.0),
-        "max_delta_step":   trial.suggest_int("max_delta_step", 0, 5),
     }
-
 
 
 def cat_suggest(trial: optuna.Trial) -> dict:
     return {
-        "iterations":          trial.suggest_int("iterations", 200, 800),
-        "depth":               trial.suggest_int("depth", 3, 10),
-        "learning_rate":       trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+        "iterations":          trial.suggest_int("iterations", 100, 400),
+        "depth":               trial.suggest_int("depth", 3, 8),
+        "learning_rate":       trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
         "l2_leaf_reg":         trial.suggest_float("l2_leaf_reg", 1e-8, 10.0, log=True),
         "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 1.0),
         "min_data_in_leaf":    trial.suggest_int("min_data_in_leaf", 1, 50),
@@ -97,10 +97,10 @@ def cat_suggest(trial: optuna.Trial) -> dict:
 
 def lgbm_suggest(trial: optuna.Trial) -> dict:
     return {
-        "n_estimators":      trial.suggest_int("n_estimators", 200, 1000),
-        "num_leaves":        trial.suggest_int("num_leaves", 20, 300),
-        "max_depth":         trial.suggest_int("max_depth", -1, 12),
-        "learning_rate":     trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+        "n_estimators":      trial.suggest_int("n_estimators", 100, 500),
+        "num_leaves":        trial.suggest_int("num_leaves", 20, 200),
+        "max_depth":         trial.suggest_int("max_depth", -1, 10),
+        "learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
         "subsample":         trial.suggest_float("subsample", 0.5, 1.0),
         "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.4, 1.0),
         "reg_alpha":         trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
@@ -117,7 +117,7 @@ OPTUNA_MODELS = [
             verbosity=0, **params,
         ), n_jobs=1),
         "suggest": xgb_suggest,
-        "n_trials": 20,
+        "n_trials": 8,
     },
     {
         "name":    "CatBoost",
@@ -126,7 +126,7 @@ OPTUNA_MODELS = [
             verbose=0, **params,
         ), n_jobs=1),
         "suggest": cat_suggest,
-        "n_trials": 15,
+        "n_trials": 5,
     },
     {
         "name":    "LightGBM",
@@ -135,36 +135,6 @@ OPTUNA_MODELS = [
             verbosity=-1, **params,
         ), n_jobs=1),
         "suggest": lgbm_suggest,
-        "n_trials": 20,
+        "n_trials": 8,
     },
 ]
-
-
-def build_lstm(units=64, dropout=0.2, learning_rate=1e-3, sequence_length=24, n_features=1, n_outputs=3):
-    """Build a 2-layer LSTM model for multi-step AQI forecasting."""
-    import tensorflow as tf
-    from tensorflow.keras import Sequential
-    from tensorflow.keras.layers import LSTM, Dense, Dropout
-    from tensorflow.keras.optimizers import Adam
-    from tensorflow.keras.regularizers import l2
-
-    model = Sequential([
-        LSTM(units, return_sequences=True, input_shape=(sequence_length, n_features),
-             recurrent_dropout=dropout, kernel_regularizer=l2(1e-4)),
-        Dropout(dropout),
-        LSTM(units // 2, kernel_regularizer=l2(1e-4)),
-        Dropout(dropout),
-        Dense(32, activation="relu"),
-        Dense(n_outputs),
-    ])
-    model.compile(optimizer=Adam(learning_rate=learning_rate), loss="huber")
-    return model
-
-
-def lstm_suggest(trial: optuna.Trial) -> dict:
-    return {
-        "units":           trial.suggest_categorical("units", [64, 128, 256]),
-        "dropout":         trial.suggest_float("dropout", 0.1, 0.5),
-        "learning_rate":   trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
-        "sequence_length": trial.suggest_categorical("sequence_length", [24, 48, 72]),
-    }

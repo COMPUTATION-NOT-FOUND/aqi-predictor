@@ -412,6 +412,81 @@ def compute_shap(best_model, X_test, feature_cols):
         print(f"[train] SHAP skipped: {e}")
 
 
+# ─── Keras Models ─────────────────────────────────────────────────────────────
+
+def train_lstm(X_train, Y_train, X_val, Y_val, X_test, Y_test,
+               y_pers, aqi_train, aqi_val, aqi_test,
+               n_trials=3, epochs=12, batch_size=64):
+    """Train a cheap LSTM with 3 Optuna trials; returns None if TF is unavailable."""
+    if os.getenv("TRAIN_KERAS", "1") != "1":
+        return None
+    try:
+        import tensorflow as tf
+        from src.training_pipeline.models import build_lstm, lstm_suggest
+        from src.training_pipeline.wrappers import KerasWrapper
+        import optuna as _optuna
+        _optuna.logging.set_verbosity(_optuna.logging.WARNING)
+
+        seq_len = 24
+
+        def _reshape(X):
+            if len(X) < seq_len:
+                pad = np.zeros((seq_len - len(X), X.shape[1]))
+                X = np.vstack([pad, X])
+            return np.stack([X[i - seq_len:i] for i in range(seq_len, len(X) + 1)])
+
+        Xt = _reshape(X_train)
+        Xv = _reshape(X_val)
+        Xe = _reshape(X_test)
+        # Align targets: each row i corresponds to original row (i + seq_len - 1)
+        Yt      = Y_train[seq_len - 1:]
+        Yv      = Y_val[seq_len - 1:]
+        Ye      = Y_test[seq_len - 1:]
+        aqi_t   = aqi_train[seq_len - 1:]
+        aqi_v   = aqi_val[seq_len - 1:]   if len(aqi_val)  >= seq_len else aqi_val
+        aqi_e   = aqi_test[seq_len - 1:]  if len(aqi_test) >= seq_len else aqi_test
+        y_pers_e = y_pers[seq_len - 1:]   if len(y_pers)   >= seq_len else y_pers
+
+        def objective(trial):
+            params = lstm_suggest(trial)
+            m = build_lstm(params, Xt.shape[2], Y_train.shape[1])
+            m.fit(Xt, Yt - aqi_t[:, None],
+                  validation_data=(Xv, Yv - aqi_v[:, None]),
+                  epochs=epochs, batch_size=batch_size,
+                  callbacks=[tf.keras.callbacks.EarlyStopping(
+                      patience=3, restore_best_weights=True)],
+                  verbose=0)
+            val_pred = m.predict(Xv, verbose=0) + aqi_v[:, None]
+            return float(np.sqrt(np.mean((Yv - val_pred) ** 2)))
+
+        study = _optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+        best_params = {**study.best_params, "sequence_length": seq_len}
+        model = build_lstm(best_params, Xt.shape[2], Y_train.shape[1])
+        model.fit(Xt, Yt - aqi_t[:, None],
+                  epochs=epochs, batch_size=batch_size,
+                  callbacks=[tf.keras.callbacks.EarlyStopping(
+                      patience=3, restore_best_weights=True)],
+                  verbose=0)
+
+        wrapper  = KerasWrapper(model)
+        test_pred = wrapper.predict(Xe) + aqi_e[:, None]
+        metrics   = evaluate_all(Ye, test_pred, y_pers_e)
+        metrics["oof_rmse"] = metrics["rmse"]   # proxy — no proper OOF for LSTM
+
+        with mlflow.start_run(run_name="LSTM"):
+            mlflow.log_params(best_params)
+            mlflow.log_metrics({k: float(v) for k, v in metrics.items()})
+
+        print(f"[train] LSTM  RMSE={metrics['rmse']:.2f}  IoA={metrics.get('ioa', 0):.3f}")
+        return {"name": "LSTM", "model": wrapper, "metrics": metrics}
+
+    except Exception as e:
+        print(f"[train] LSTM skipped: {e}")
+        return None
+
+
 # ─── Ablation Feedback ────────────────────────────────────────────────────────
 
 ABLATION_DISABLE_THRESHOLD = -0.5   # drop a group if removing it improves RMSE by >0.5
@@ -428,14 +503,23 @@ def _persist_ablation_overrides(deltas: dict):
     doc = db["feature_overrides"].find_one({"_id": "current"}) or {}
     overrides = {k: v for k, v in doc.items() if k != "_id"}
 
+    # forecast_leads is locked off permanently: it is a target-leaked feature that
+    # ablation would re-enable (dropping it looks catastrophic to the score).
+    _LOCKED_OFF = {"forecast_leads"}
+
     changed = []
     for group, delta in deltas.items():
+        if group in _LOCKED_OFF:
+            continue
         if delta < ABLATION_DISABLE_THRESHOLD and FEATURE_GROUPS.get(group, True):
             overrides[group] = False
             changed.append(f"disabled '{group}' (Δ={delta:+.2f})")
         elif delta >= ABLATION_REENABLE_THRESHOLD and overrides.get(group) is False:
             overrides[group] = True
             changed.append(f"re-enabled '{group}' (Δ={delta:+.2f})")
+
+    # Ensure any previously-stored MongoDB override for the locked group is cleared.
+    overrides["forecast_leads"] = False
 
     db["feature_overrides"].update_one(
         {"_id": "current"},
@@ -479,10 +563,43 @@ def main():
     )
     all_results += ensemble_results
 
+    # 5b. Keras challengers — gated by TRAIN_KERAS env flag (default on)
+    _KERAS_NAMES = {"LSTM", "DistilledMLP"}
+    if os.getenv("TRAIN_KERAS", "1") == "1":
+        lstm_result = train_lstm(
+            X_train, Y_train, X_val, Y_val, X_test, Y_test,
+            y_pers, aqi_train, aqi_val, aqi_test,
+        )
+        if lstm_result is not None:
+            all_results.append(lstm_result)
+
+        try:
+            from src.training_pipeline.distillation import distill
+            from src.training_pipeline.wrappers import KerasWrapper as _KW
+            sklearn_results = [r for r in all_results if r["name"] not in _KERAS_NAMES]
+            teachers_sorted = sorted(
+                sklearn_results, key=lambda r: r["metrics"].get("oof_rmse", 999)
+            )[:3]
+            if len(teachers_sorted) >= 2:
+                teachers = [r["model"] for r in teachers_sorted]
+                t_rmses  = [r["metrics"].get("oof_rmse", 999) for r in teachers_sorted]
+                student  = distill(teachers, t_rmses, X_train, Y_train, X_val, Y_val, epochs=30)
+                sw       = _KW(student)
+                d_pred   = sw.predict(X_test)
+                d_metrics = evaluate_all(Y_test, d_pred, y_pers)
+                d_metrics["oof_rmse"] = d_metrics["rmse"]
+                with mlflow.start_run(run_name="DistilledMLP"):
+                    mlflow.log_metrics({k: float(v) for k, v in d_metrics.items()})
+                print(f"[train] DistilledMLP  RMSE={d_metrics['rmse']:.2f}  IoA={d_metrics.get('ioa', 0):.3f}")
+                all_results.append({"name": "DistilledMLP", "model": sw, "metrics": d_metrics})
+        except Exception as e:
+            print(f"[train] DistilledMLP skipped: {e}")
+
     # WeightedVoter.fit inside _oof_rmse mutates the constituent model objects
     # (Ridge, XGBoost, etc.) in-place, leaving them fit on an OOF subset instead
     # of the full training set.  Refit every sklearn model here so the state
     # saved to GridFS by register_all is always fit on 100% of X_train.
+    # LSTM/DistilledMLP are excluded — they are not sklearn estimators.
     Y_train_res = Y_train - aqi_train[:, None]
     _w_full = np.linspace(0.5, 1.0, len(X_train))
     for r in classical_results + optuna_results:
@@ -495,7 +612,10 @@ def main():
     # 6. Conformal prediction calibration (on primary target aqi_24h)
     # The champion model predicts residuals; add aqi_val offset so calibration
     # residuals (|pred_abs - true_abs|) are in correct absolute AQI units.
-    best_non_lstm = sorted(all_results, key=lambda r: r["metrics"]["rmse"])[0]
+    best_non_lstm = sorted(
+        [r for r in all_results if r["name"] not in _KERAS_NAMES],
+        key=lambda r: r["metrics"]["rmse"],
+    )[0]
 
     try:
         class _ResidualToAbsWrapper:
@@ -525,8 +645,11 @@ def main():
         _persist_ablation_overrides(ablation_deltas)
 
     # 9. Register all + Champion-Challenger
+    # LSTM and DistilledMLP appear on the leaderboard but cannot be promoted —
+    # the Streamlit dashboard has no TensorFlow and would fail to unpickle them.
     register_all(all_results,
-                 champion_eligible_names={r["name"] for r in all_results},
+                 champion_eligible_names={r["name"] for r in all_results
+                                          if r["name"] not in _KERAS_NAMES},
                  feature_cols=feature_cols)
 
     # 11. Save champion OOF predictions for hindcast chart

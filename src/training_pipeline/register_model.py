@@ -15,10 +15,19 @@ Champion Selection Rules (TOPSIS multi-criteria)
 
   All models save metadata regardless of promotion outcome (for leaderboard).
   Only the champion's binary artifacts are stored in GridFS (storage budget).
+
+Training History
+----------------
+  After every promotion decision, one document per model is appended to the
+  training_history collection via insert_many (never upsert). This gives a
+  permanent, append-only log across all CI runs. model_metadata continues to
+  hold only the current run's results (live leaderboard); training_history
+  is purely additive and is never modified.
 """
 import io
 import json
 import pickle
+import uuid
 import zipfile
 from pathlib import Path
 from datetime import datetime, timezone
@@ -123,6 +132,61 @@ def _save_champion_artifacts(model, metrics: dict, tags: dict,
     print(f"[register] Champion artifacts uploaded to GridFS (id={file_id})")
 
 
+def _ensure_history_indexes() -> None:
+    col = get_db()["training_history"]
+    col.create_index([("model_name", 1), ("trained_at", -1)])
+    col.create_index("run_id")
+
+
+def _save_training_history(
+    models_with_metrics: list[dict],
+    champion_eligible_names: set | None,
+    promoted_name: str | None,
+    run_id: str,
+    trained_at: str,
+    feature_cols: list[str] | None,
+) -> None:
+    from src.config import FEATURE_GROUPS
+
+    _ensure_history_indexes()
+
+    run_ctx = {
+        "run_id":            run_id,
+        "trained_at":        trained_at,
+        "feature_groups":    {k: bool(v) for k, v in FEATURE_GROUPS.items()},
+        "feature_count":     len(feature_cols) if feature_cols is not None else None,
+        "github_sha":        os.getenv("GITHUB_SHA"),
+        "github_run_number": os.getenv("GITHUB_RUN_NUMBER"),
+    }
+
+    docs = []
+    for entry in models_with_metrics:
+        name    = entry["name"]
+        model   = entry["model"]
+        metrics = entry["metrics"]
+
+        if champion_eligible_names is not None:
+            eligible = name in champion_eligible_names
+        else:
+            eligible = name not in _KERAS_INELIGIBLE_NAMES and not _is_keras_model(model)
+
+        doc = {
+            **run_ctx,
+            "model_name":        name,
+            "model_type":        "keras" if _is_keras_model(model) else "sklearn",
+            "champion_eligible": eligible,
+            "promoted":          name == promoted_name,
+            "topsis_score":      metrics.get("topsis_score"),
+            # spread all metric keys at the top level for easy querying
+            **{k: (float(v) if isinstance(v, (int, float, np.integer, np.floating)) else v)
+               for k, v in metrics.items()},
+        }
+        docs.append(doc)
+
+    get_db()["training_history"].insert_many(docs)
+    print(f"[register] History: inserted {len(docs)} docs for run {run_id}")
+
+
 def register_all(models_with_metrics: list[dict], champion_eligible_names: set = None,
                  feature_cols: list[str] | None = None) -> dict:
     """
@@ -138,6 +202,11 @@ def register_all(models_with_metrics: list[dict], champion_eligible_names: set =
     Returns:
         dict with champion model info including topsis_score.
     """
+    # Shared run identity — used by training_history insert at the end.
+    run_id     = os.getenv("GITHUB_RUN_ID") or uuid.uuid4().hex
+    trained_at = datetime.now(timezone.utc).isoformat()
+    promoted_name: str | None = None   # set below once we know who was promoted
+
     # ── Load current champion from MongoDB ────────────────────────────────────
     current_champion        = None
     current_champion_topsis = -1.0
@@ -216,7 +285,13 @@ def register_all(models_with_metrics: list[dict], champion_eligible_names: set =
 
     if not eligible_entries:
         print("[register] No valid challenger found — all models failed hard gates")
-        return {}
+        result = {}
+        try:
+            _save_training_history(models_with_metrics, champion_eligible_names,
+                                   promoted_name, run_id, trained_at, feature_cols)
+        except Exception as _he:
+            print(f"[register] History write failed (non-fatal): {_he}")
+        return result
 
     # ── TOPSIS ranking across all eligible challengers ─────────────────────────
     eligible_metrics = [e["metrics"] for e in eligible_entries]
@@ -264,7 +339,8 @@ def register_all(models_with_metrics: list[dict], champion_eligible_names: set =
             },
             feature_cols=feature_cols,
         )
-        return {
+        promoted_name = best_name
+        result = {
             "champion":     best_name,
             "rmse":         best_rmse,
             "topsis_score": best_score,
@@ -276,13 +352,22 @@ def register_all(models_with_metrics: list[dict], champion_eligible_names: set =
             f"by {(_TOPSIS_THRESHOLD - 1) * 100:.0f}%"
         )
         print(f"[register] NOT promoted: {reason}")
-        return {
+        result = {
             "champion":     current_champion,
             "rmse":         current_champion_rmse,
             "topsis_score": current_champion_topsis,
             "promoted":     False,
             "reason":       reason,
         }
+
+    # ── Append-only history — never aborts a training run on failure ───────────
+    try:
+        _save_training_history(models_with_metrics, champion_eligible_names,
+                               promoted_name, run_id, trained_at, feature_cols)
+    except Exception as _he:
+        print(f"[register] History write failed (non-fatal): {_he}")
+
+    return result
 
 
 def freeze_model(model_name: str, freeze: bool = True) -> None:

@@ -200,6 +200,9 @@ def compute_forecast_lead_features(forecast: dict, horizons=tuple(FORECAST_HOURS
         for raw_key, prefix in FORECAST_LEAD_MAP.items():
             val = fh.get(raw_key, 0.0)
             row[f"{prefix}_t{h}"] = float(val) if val is not None else 0.0
+        # TODO: replace pm25_fc source with Open-Meteo historical-forecast archive
+        # (past issued forecasts, not realized actuals) so training matches serving,
+        # then re-enable forecast_leads in FEATURE_GROUPS.
         row[f"aqi_fc_t{h}"] = float(pm25_to_aqi(fh.get("pm25_fc", 0.0)))
     return row
 

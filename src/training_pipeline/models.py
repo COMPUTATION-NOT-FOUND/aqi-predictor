@@ -138,3 +138,30 @@ OPTUNA_MODELS = [
         "n_trials": 8,
     },
 ]
+
+
+# ─── Keras Models (leaderboard-only; champion-ineligible) ─────────────────────
+
+def build_lstm(params: dict, n_features: int, n_outputs: int):
+    """Cheap cuDNN-compatible LSTM (no recurrent_dropout, which forces slow non-cuDNN path)."""
+    import tensorflow as tf
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(params["sequence_length"], n_features)),
+        tf.keras.layers.LSTM(params["units"], return_sequences=False),
+        tf.keras.layers.Dropout(params["dropout"]),
+        tf.keras.layers.Dense(n_outputs),
+    ])
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(params["learning_rate"]),
+        loss="mse",
+    )
+    return model
+
+
+def lstm_suggest(trial) -> dict:
+    return {
+        "units":           trial.suggest_categorical("units", [32, 64]),
+        "sequence_length": 24,
+        "dropout":         trial.suggest_float("dropout", 0.1, 0.3),
+        "learning_rate":   1e-3,
+    }

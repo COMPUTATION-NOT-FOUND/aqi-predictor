@@ -1,26 +1,23 @@
 #!/usr/bin/env bash
-# run_local.sh — Launch the dashboard locally for development & presentation testing
+# run_local.sh — Launch the Streamlit dashboard locally for development & testing
 #
 # Why this exists
 # ---------------
-# Render.com's free tier kills worker processes after 120–300 s of slow
-# Hopsworks queries, making it hard to tell whether bugs are in the app
-# or in the hosting environment.  Run this script locally — it uses
-# the same gunicorn config as production but on your machine where there
-# is no memory limit or worker timeout.
+# Launches the same entry point as Streamlit Community Cloud (app.py at repo root)
+# so you can test dashboard changes locally before pushing.
+# No gunicorn, no Render, no Hopsworks needed.
 #
 # Prerequisites
 # -------------
-#   1.  cp .env.example .env  (and fill in your API keys)
-#   2.  pip install -r requirements.txt
-#   3.  pip install gunicorn          (if not already installed)
+#   1.  cp .env.example .env  (fill in MONGODB_URI, MONGODB_DB_NAME, API keys)
+#   2.  pip install -r requirements-dashboard.txt
 #
 # Usage
 # -----
 #   chmod +x run_local.sh
 #   ./run_local.sh
 #
-# Then open http://localhost:8050 in your browser.
+# Then open http://localhost:8501 in your browser (Streamlit default port).
 #
 # To stop:  Ctrl-C
 
@@ -41,7 +38,7 @@ else
 fi
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-export PORT="${PORT:-8050}"
+export PORT="${PORT:-8501}"
 export MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-mlruns}"
 
 echo ""
@@ -50,7 +47,6 @@ echo "║  Pearls AQI Predictor — local development server         ║"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  URL:          http://localhost:${PORT}                     ║"
 echo "║  MLflow URI:   ${MLFLOW_TRACKING_URI}                           ║"
-echo "║  Hopsworks:    ${HOPSWORKS_PROJECT:-NOT SET}                         ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""
 

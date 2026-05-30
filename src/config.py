@@ -42,7 +42,9 @@ FEATURE_GROUPS = {
     "stl_decomp":      True,   # aqi_trend, aqi_seasonal, aqi_residual
     "raw_pollutants":  True,   # PM2.5, PM10, O3, NO2, SO2, CO (keep True)
     "meteorology":     True,   # temperature, humidity, wind_speed, pressure, etc.
-    "forecast_leads":  True,   # forecasted weather + PM2.5 at t+24/48/72h (Open-Meteo/CAMS)
+    "forecast_leads":  False,  # DISABLED — backfill fills these from realized future values
+                               # (aqi_fc_t{h} == target aqi_{h}h on every training row).
+                               # Re-enable once backfill uses Open-Meteo historical-forecast archive.
 }
 
 # Apply persisted ablation overrides — MongoDB is the source of truth so the
@@ -61,6 +63,10 @@ def _load_feature_overrides() -> dict:
     return {}
 
 FEATURE_GROUPS.update(_load_feature_overrides())
+# Hard override — keeps forecast_leads off even if a stale MongoDB document or the
+# ablation loop tries to re-enable it (ablation sees removing a leaked feature as
+# catastrophic RMSE regression and would otherwise flip it back on).
+FEATURE_GROUPS["forecast_leads"] = False
 
 # ─── Drift Thresholds ─────────────────────────────────────────────────────────
 PSI_WARN_THRESHOLD  = 0.1   # moderate drift

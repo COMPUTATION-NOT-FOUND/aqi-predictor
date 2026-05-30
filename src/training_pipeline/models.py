@@ -117,7 +117,7 @@ OPTUNA_MODELS = [
             verbosity=0, **params,
         ), n_jobs=1),
         "suggest": xgb_suggest,
-        "n_trials": 50,
+        "n_trials": 20,
     },
     {
         "name":    "CatBoost",
@@ -126,7 +126,7 @@ OPTUNA_MODELS = [
             verbose=0, **params,
         ), n_jobs=1),
         "suggest": cat_suggest,
-        "n_trials": 35,
+        "n_trials": 15,
     },
     {
         "name":    "LightGBM",
@@ -135,7 +135,7 @@ OPTUNA_MODELS = [
             verbosity=-1, **params,
         ), n_jobs=1),
         "suggest": lgbm_suggest,
-        "n_trials": 50,
+        "n_trials": 20,
     },
 ]
 

@@ -66,8 +66,9 @@ for _logger in ["mlflow", "mlflow.models.model", "mlflow.sklearn", "mlflow.utils
                 "mlflow.tensorflow", "tensorflow", "absl"]:
     logging.getLogger(_logger).setLevel(logging.ERROR)
 
-TARGET_COLS  = [f"aqi_{h}h" for h in FORECAST_HOURS]
-N_SPLITS_OOF = 3
+TARGET_COLS   = [f"aqi_{h}h" for h in FORECAST_HOURS]
+N_SPLITS_OOF  = 2
+MAX_TRAIN_ROWS = int(os.getenv("MAX_TRAIN_ROWS", "8760"))  # ~1 year; covers full seasonal cycle
 SHAP_PATH    = Path(__file__).parent.parent.parent / "shap_values.pkl"
 
 
@@ -81,6 +82,10 @@ def load_and_split():
     print("[train] Loading features from MongoDB...")
     df = fetch_training_data()
     df = df.dropna(subset=TARGET_COLS)
+
+    if MAX_TRAIN_ROWS > 0 and len(df) > MAX_TRAIN_ROWS:
+        df = df.tail(MAX_TRAIN_ROWS).reset_index(drop=True)
+        print(f"[train] Capped to {MAX_TRAIN_ROWS} most-recent rows")
 
     from src.config import FEATURE_GROUPS
     drop_meta = ["timestamp", "city"] + TARGET_COLS
@@ -249,7 +254,7 @@ def train_classical(X_train, Y_train, X_test, Y_test, y_persistence,
             Y_train_fit = Y_train - aqi_train[:, None] if aqi_train is not None else Y_train
             search = RandomizedSearchCV(
                 est, spec["param_dist"],
-                n_iter=15, cv=TimeSeriesSplit(n_splits=3, gap=72),
+                n_iter=8, cv=TimeSeriesSplit(n_splits=2, gap=72),
                 scoring="neg_root_mean_squared_error",
                 n_jobs=-1, random_state=42, verbose=0,
             )
@@ -302,7 +307,7 @@ def train_optuna(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence,
             def objective(trial):
                 params = spec["suggest"](trial)
                 model  = spec["factory"](params)
-                tscv   = TimeSeriesSplit(n_splits=3, gap=72)
+                tscv   = TimeSeriesSplit(n_splits=2, gap=72)
                 rmses  = []
                 for tr, val in tscv.split(X_train):
                     model.fit(X_train[tr], Y_train_fit[tr])

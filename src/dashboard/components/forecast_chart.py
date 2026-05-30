@@ -193,9 +193,10 @@ def build_hindcast_chart(
         )
 
     fig.update_layout(**_base_layout(
-        "Model Verification — OOF Predictions vs Observed",
-        "OOF = out-of-fold (held-out) — leakage-free · "
-        "IoA: Willmott (1981) · Skill: Murphy (1988) 1 − RMSE_model/RMSE_persistence",
+        "Champion Hindcast — 24h-Ahead OOF Predictions vs Observed",
+        "24h horizon only, over the full history (leakage-free out-of-fold) — looks "
+        "stronger than the pooled 24/48/72h leaderboard RMSE · IoA: Willmott (1981) · "
+        "Skill: Murphy (1988) 1 − RMSE_model/RMSE_persistence",
     ))
     if has_oof:
         all_vals = pd.concat([

@@ -69,7 +69,12 @@ def load_champion():
             # Champion should never be Keras (excluded from eligibility), but guard anyway.
             print("[predict] Champion is Keras — not supported in the precompute step.")
             return None, None, None, None, None, False
-        model = pickle.loads(zf.read("model.pkl"))
+        try:
+            model = pickle.loads(zf.read("model.pkl"))
+        except Exception as e:
+            print(f"[predict] Failed to unpickle champion model: {e}")
+            print("[predict] Likely a scikit-learn version mismatch — retrain to fix.")
+            return None, None, None, None, None, False
         if "scaler_bundle.pkl" in names:
             scaler = pickle.loads(zf.read("scaler_bundle.pkl"))
         if feature_cols is None and "feature_cols.json" in names:

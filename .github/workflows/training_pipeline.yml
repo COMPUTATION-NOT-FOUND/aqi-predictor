@@ -30,6 +30,7 @@ jobs:
           MONGODB_URI:         ${{ secrets.MONGODB_URI }}
           MONGODB_DB_NAME:     ${{ secrets.MONGODB_DB_NAME }}
           MLFLOW_TRACKING_URI: "mlruns"
+          MLFLOW_ALLOW_FILE_STORE: "true"
         run: python src/backfill/ablation_backfill.py
 
       - name: Fill null training targets from stored AQICN observations
@@ -46,6 +47,7 @@ jobs:
           MONGODB_DB_NAME:     ${{ secrets.MONGODB_DB_NAME }}
           MLFLOW_TRACKING_URI: "mlruns"
           PYTHONUNBUFFERED:    "1"
+          MLFLOW_ALLOW_FILE_STORE: "true"
         run: python -u src/training_pipeline/train_model.py
 
       - name: Upload MLflow artifacts

@@ -51,6 +51,15 @@ mlartifacts/
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
+# ── LaTeX build intermediates (keep report.pdf, drop the rest) ────────────────
+report/*.aux
+report/*.log
+report/*.toc
+report/*.out
+report/*.fls
+report/*.fdb_latexmk
+report/*.synctex.gz
+
 # ── Testing ───────────────────────────────────────────────────────────────────
 .pytest_cache/
 .coverage

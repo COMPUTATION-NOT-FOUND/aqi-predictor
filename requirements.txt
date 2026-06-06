@@ -45,3 +45,4 @@ dash-bootstrap-components>=1.5.0
 
 # Notebook
 jupyter>=1.0.0
+kaleido>=0.2.1   # static Plotly PNG export for the EDA notebook -> report/figures/

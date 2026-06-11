@@ -1,48 +1,28 @@
-# Server
-gunicorn>=21.2.0
+# Default requirements: the Streamlit dashboard (deployed on Streamlit Community Cloud).
+# Streamlit Cloud always installs THIS file, so it must stay slim and conflict-free.
+# Reads everything from MongoDB; never runs live inference or training.
+# Excludes tensorflow/optuna/mlflow/jupyter (training-only) and dash/gunicorn (replaced by Streamlit).
+# Full training pipeline deps live in requirements-training.txt.
 
-# Data fetching & utilities
-openmeteo-requests>=0.3.0
-requests-cache>=1.2.0
-retry-requests>=2.0.0
-requests>=2.31.0
-python-dotenv>=1.0.0
+# Dashboard framework
+streamlit>=1.40.0
+plotly>=5.19.0
+
+# Data + utilities
 pandas>=2.1.0
 numpy>=1.26.0
+python-dotenv>=1.0.0
 
 # Database
 pymongo[srv]>=4.6.0
 
-# Experiment tracking
-mlflow>=2.11.0
-
-# ML — classical & boosting
-scikit-learn==1.9.0
+# ML — needed to unpickle champion artifacts and compute SHAP / intervals
+scikit-learn>=1.4.0
 xgboost>=2.0.0
-lightgbm>=4.3.0
 catboost>=1.2.0
-optuna>=3.5.0
-
-# ML — feature selection (pure-Python mRMR, no Cython required)
-mrmr-selection>=0.2.8
-
-# ML — deep learning (2.16+ supports Python 3.12)
-tensorflow>=2.16.0
-
-# Explainability
+lightgbm>=4.3.0
 shap>=0.44.0
-
-# Conformal prediction
 mapie>=0.8.0
 
-# Time series decomposition
+# Time-series decomposition (build_feature_row → STL, imported transitively)
 statsmodels>=0.14.0
-
-# Dashboard
-plotly>=5.19.0
-dash>=2.16.0
-dash-bootstrap-components>=1.5.0
-
-# Notebook
-jupyter>=1.0.0
-kaleido>=0.2.1   # static Plotly PNG export for the EDA notebook -> report/figures/

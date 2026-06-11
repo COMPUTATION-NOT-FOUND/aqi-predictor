@@ -43,7 +43,9 @@ OpenWeather ─┘         (hourly)                           (daily)
            # edit .env with your actual keys
 
 □ Step 6 — Install dependencies
-           pip install -r requirements.txt
+           # Full pipeline (backfill, feature eng, training):
+           pip install -r requirements-training.txt
+           # Dashboard only: pip install -r requirements.txt
 
 □ Step 7 — Run backfill ONCE to seed the feature store
            python src/backfill/backfill_features.py

@@ -10,7 +10,7 @@
 # Prerequisites
 # -------------
 #   1.  cp .env.example .env  (fill in MONGODB_URI, MONGODB_DB_NAME, API keys)
-#   2.  pip install -r requirements-dashboard.txt
+#   2.  pip install -r requirements.txt   (slim dashboard deps)
 #
 # Usage
 # -----

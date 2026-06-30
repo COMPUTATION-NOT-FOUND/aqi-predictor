@@ -278,7 +278,10 @@ def train_classical(X_train, Y_train, X_test, Y_test, y_persistence,
 
             mlflow.log_params(best_params)
             mlflow.log_metrics(metrics)
-            mlflow.sklearn.log_model(best_est, name="model")
+            mlflow.sklearn.log_model(
+                best_est, name="model",
+                serialization_format=mlflow.sklearn.SERIALIZATION_FORMAT_CLOUDPICKLE,
+            )
 
             print(f"[train] {name}: RMSE={metrics['rmse']:.2f} | IoA={metrics['ioa']:.3f} | "
                   f"Skill={metrics.get('skill_score', 0):.3f} | OOF={oof:.2f}")
@@ -336,7 +339,10 @@ def train_optuna(X_train, Y_train, X_val, Y_val, X_test, Y_test, y_persistence,
 
             mlflow.log_params(best_params)
             mlflow.log_metrics(metrics)
-            mlflow.sklearn.log_model(best_model, name="model")
+            mlflow.sklearn.log_model(
+                best_model, name="model",
+                serialization_format=mlflow.sklearn.SERIALIZATION_FORMAT_CLOUDPICKLE,
+            )
 
             print(f"[train] {name}: RMSE={metrics['rmse']:.2f} | OOF={oof:.2f}")
             results.append({"name": name, "model": best_model, "metrics": metrics})

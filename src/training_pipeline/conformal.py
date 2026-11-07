@@ -2,7 +2,7 @@
 Conformal prediction intervals using MAPIE.
 
 Provides distribution-free prediction intervals at a guaranteed coverage level
-(default 90%). The intervals are computed for the distilled student model.
+(default 90%). The intervals are computed for the best trained model.
 
 Why conformal prediction over simple error bars?
   - No distributional assumptions (works for any model)

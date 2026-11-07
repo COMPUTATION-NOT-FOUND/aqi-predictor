@@ -67,6 +67,11 @@ def run_pipeline(city: str = DEFAULT_CITY, lat: float = DEFAULT_LAT, lon: float 
         print(f"[pipeline] forecast fetch failed ({e}) — lead features will be 0")
         forecast = {}
 
+    # 2b'. Log the CAMS forecast as an outside baseline (scored at training time).
+    if forecast:
+        from src.feature_pipeline.cams_baseline import log_cams_forecast
+        log_cams_forecast(city, ts, forecast)
+
     # 2c. Current AQI = 24h trailing-mean PM2.5 → AQI (EPA-style; matches backfill/targets).
     pm25_window = []
     if not history.empty and "pm25" in history.columns:
@@ -91,6 +96,11 @@ def run_pipeline(city: str = DEFAULT_CITY, lat: float = DEFAULT_LAT, lon: float 
     # keeps the two paths consistent and prevents the scaler from being
     # re-fit on already-scaled data during daily training runs.
     insert_features(df)
+    try:
+        from src.db import ensure_ttl_indexes
+        ensure_ttl_indexes()
+    except Exception as e:
+        print(f"[pipeline] TTL index check failed (non-fatal): {e}")
 
     # 4b. Promote current pm25-derived AQI as training target for rows 24/48/72h ago.
     # row["aqi"] is now always pm25_to_aqi(openweather_pm25) — consistent with backfill.

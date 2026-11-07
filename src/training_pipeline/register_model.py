@@ -47,15 +47,14 @@ _MIN_IOA          = 0.15
 _MIN_SKILL_SCORE  = 0.0
 _TOPSIS_THRESHOLD = 1.01
 
-_KERAS_INELIGIBLE_NAMES = {"LSTM", "GRU", "Transformer", "lstm", "gru"}
+# Models that are shown on the leaderboard but can never become champion.
+# ChronosBolt and CAMS are outside baselines with no artifact to store. The old Keras names stay listed so
+# a leftover Keras champion in an existing database is replaced on the next run.
+_LEADERBOARD_ONLY_NAMES = {"ChronosBolt", "CAMS", "LSTM", "DistilledMLP"}
 
-
-def _is_keras_model(model) -> bool:
-    try:
-        import tensorflow as tf
-        return isinstance(model, tf.keras.Model)
-    except ImportError:
-        return False
+# training_history grows by ~15 docs a day. Keep only the most recent runs so the
+# free 512 MB Atlas tier never fills up.
+HISTORY_KEEP_RUNS = int(os.getenv("HISTORY_KEEP_RUNS", "90"))
 
 
 def _save_metadata(name: str, metrics: dict, tags: dict) -> None:
@@ -93,16 +92,8 @@ def _save_champion_artifacts(model, metrics: dict, tags: dict,
     # Build ZIP in memory — no temp directory needed for pkl models
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        if _is_keras_model(model):
-            import tempfile
-            with tempfile.TemporaryDirectory() as td:
-                model_path = os.path.join(td, "model.keras")
-                model.save(model_path)
-                zf.write(model_path, "model.keras")
-            zf.writestr("model_type.txt", "keras")
-        else:
-            zf.writestr("model.pkl", pickle.dumps(model))
-            zf.writestr("model_type.txt", "sklearn")
+        zf.writestr("model.pkl", pickle.dumps(model))
+        zf.writestr("model_type.txt", "sklearn")
 
         if feature_cols is not None:
             zf.writestr("feature_cols.json", json.dumps(list(feature_cols)))
@@ -168,12 +159,12 @@ def _save_training_history(
         if champion_eligible_names is not None:
             eligible = name in champion_eligible_names
         else:
-            eligible = name not in _KERAS_INELIGIBLE_NAMES and not _is_keras_model(model)
+            eligible = name not in _LEADERBOARD_ONLY_NAMES
 
         doc = {
             **run_ctx,
             "model_name":        name,
-            "model_type":        "keras" if _is_keras_model(model) else "sklearn",
+            "model_type":        "zero-shot" if model is None else "sklearn",
             "champion_eligible": eligible,
             "promoted":          name == promoted_name,
             "topsis_score":      metrics.get("topsis_score"),
@@ -183,8 +174,25 @@ def _save_training_history(
         }
         docs.append(doc)
 
-    get_db()["training_history"].insert_many(docs)
+    col = get_db()["training_history"]
+    col.insert_many(docs)
     print(f"[register] History: inserted {len(docs)} docs for run {run_id}")
+    _prune_history(col)
+
+
+def _prune_history(col, keep_runs: int = HISTORY_KEEP_RUNS) -> None:
+    """Delete every training_history doc older than the newest `keep_runs` runs."""
+    older = col.aggregate([
+        {"$group": {"_id": "$run_id", "trained_at": {"$max": "$trained_at"}}},
+        {"$sort": {"trained_at": -1}},
+        {"$skip": keep_runs},
+        {"$limit": 1},
+    ])
+    cutoff = next(iter(older), None)
+    if cutoff is None:
+        return
+    gone = col.delete_many({"trained_at": {"$lte": cutoff["trained_at"]}}).deleted_count
+    print(f"[register] History: pruned {gone} docs older than the last {keep_runs} runs")
 
 
 def register_all(models_with_metrics: list[dict], champion_eligible_names: set = None,
@@ -197,7 +205,7 @@ def register_all(models_with_metrics: list[dict], champion_eligible_names: set =
         models_with_metrics: list of dicts with keys:
           name, model, metrics (dict with 'oof_rmse', 'ioa', 'skill_score', 'mae', etc.)
         champion_eligible_names: set of model names allowed to compete for champion.
-          Defaults to all non-Keras models.
+          Defaults to every model not in _LEADERBOARD_ONLY_NAMES.
 
     Returns:
         dict with champion model info including topsis_score.
@@ -221,11 +229,10 @@ def register_all(models_with_metrics: list[dict], champion_eligible_names: set =
             is_frozen               = bool(meta.get("is_frozen", False))
             current_champion_topsis = float(meta.get("topsis_score", -1.0))
 
-            is_keras = str(meta.get("model_type", "")) == "keras" or \
-                       current_champion in _KERAS_INELIGIBLE_NAMES
-            if is_keras:
-                print(f"[register] Current champion '{current_champion}' is Keras/LSTM — "
-                      f"setting effective TOPSIS to -1 so any sklearn model can replace it.")
+            if str(meta.get("model_type", "")) == "keras" or \
+                    current_champion in _LEADERBOARD_ONLY_NAMES:
+                print(f"[register] Current champion '{current_champion}' is a retired "
+                      f"model type; any eligible model can replace it.")
                 current_champion_topsis = -1.0
                 current_champion_rmse   = np.inf
 
@@ -253,7 +260,7 @@ def register_all(models_with_metrics: list[dict], champion_eligible_names: set =
         if champion_eligible_names is not None:
             eligible = name in champion_eligible_names
         else:
-            eligible = name not in _KERAS_INELIGIBLE_NAMES and not _is_keras_model(model)
+            eligible = name not in _LEADERBOARD_ONLY_NAMES
 
         if eligible and candidate_ioa < _MIN_IOA:
             print(f"[register] {name} BLOCKED — IoA={candidate_ioa:.3f} < {_MIN_IOA}")
@@ -276,7 +283,7 @@ def register_all(models_with_metrics: list[dict], champion_eligible_names: set =
             "trained_at":  datetime.now(timezone.utc).isoformat(),
             "is_champion": False,
             "is_frozen":   False,
-            "model_type":  "keras" if _is_keras_model(model) else "sklearn",
+            "model_type":  "zero-shot" if model is None else "sklearn",
             "artifacts_gridfs_id": None,
         })
 
@@ -335,7 +342,7 @@ def register_all(models_with_metrics: list[dict], champion_eligible_names: set =
                 "is_frozen":     False,
                 "promoted_at":   datetime.now(timezone.utc).isoformat(),
                 "promoted_from": best_name,
-                "model_type":    "keras" if _is_keras_model(best_entry["model"]) else "sklearn",
+                "model_type":    "sklearn",
             },
             feature_cols=feature_cols,
         )

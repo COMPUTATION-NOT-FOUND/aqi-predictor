@@ -240,3 +240,24 @@ with tab_shap:
     st.caption("Mean |SHAP| contribution of each feature on the best tree-based model. "
                "Longer bar = more influence on the prediction.")
     st.plotly_chart(build_shap_bar(c_shap(), top_n=15), **_PLOTLY)
+
+
+# ─── Footer ─────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def c_storage():
+    try:
+        from src.db import storage_stats
+        return storage_stats()
+    except Exception:
+        return None
+
+
+st.divider()
+_s = c_storage()
+_storage = (f"Database: {_s['storage_mb'] + _s['index_mb']:.1f} MB of the 512 MB free tier "
+            f"({_s['objects']:,} documents)." if _s else "Database size unavailable.")
+st.caption(
+    f"{_storage} Code written with AI assistance and reviewed by the author. "
+    "Forecasts are experimental; for health decisions use official sources."
+)

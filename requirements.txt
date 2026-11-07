@@ -1,7 +1,7 @@
 # Default requirements: the Streamlit dashboard (deployed on Streamlit Community Cloud).
 # Streamlit Cloud always installs THIS file, so it must stay slim and conflict-free.
 # Reads everything from MongoDB; never runs live inference or training.
-# Excludes tensorflow/optuna/mlflow/jupyter (training-only) and dash/gunicorn (replaced by Streamlit).
+# Excludes optuna/mlflow/torch (training-only).
 # Full training pipeline deps live in requirements-training.txt.
 
 # Dashboard framework
@@ -17,7 +17,7 @@ python-dotenv>=1.0.0
 pymongo[srv]>=4.6.0
 
 # ML — needed to unpickle champion artifacts and compute SHAP / intervals
-scikit-learn>=1.4.0
+scikit-learn==1.9.0   # must match training, or the pickled models fail to load
 xgboost>=2.0.0
 catboost>=1.2.0
 lightgbm>=4.3.0

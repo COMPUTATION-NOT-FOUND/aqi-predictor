@@ -9,6 +9,8 @@ jobs:
   feature-pipeline:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
 
     steps:
       - name: Checkout repo
@@ -26,9 +28,9 @@ jobs:
 
       - name: Run feature pipeline
         env:
-          AQICN_API_KEY:       ${{ secrets.AQICN_API_KEY }}       # FILL IN: add to GitHub repo Secrets
-          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }} # FILL IN: add to GitHub repo Secrets
-          MONGODB_URI:         ${{ secrets.MONGODB_URI }}         # FILL IN: Atlas SRV connection string
+          AQICN_API_KEY:       ${{ secrets.AQICN_API_KEY }}
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+          MONGODB_URI:         ${{ secrets.MONGODB_URI }}
           MONGODB_DB_NAME:     ${{ secrets.MONGODB_DB_NAME }}
           DEFAULT_CITY:        "karachi"
           MLFLOW_TRACKING_URI: "mlruns"
@@ -43,17 +45,15 @@ jobs:
           DEFAULT_CITY:        "karachi"
         run: python src/feature_pipeline/predict.py
 
-      - name: Send drift alert email (if PSI > 0.2)
+      - name: Email if the pipeline failed
         if: failure() && env.ALERT_EMAIL != ''
-        env:
-          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
           server_port: 465
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "AQI Pipeline: Data Drift Alert"
-          body: "PSI drift threshold exceeded in the AQI feature pipeline. Check the drift dashboard."
+          subject: "AQI feature pipeline failed"
+          body: "The hourly AQI feature pipeline failed. See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           to: ${{ secrets.ALERT_EMAIL }}
           from: AQI Predictor Bot

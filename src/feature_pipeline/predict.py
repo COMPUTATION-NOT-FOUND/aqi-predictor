@@ -39,7 +39,7 @@ from src.feature_pipeline.store_features import fetch_recent
 #     since predict.py also runs as __main__, importing the names here binds them
 #     into __main__ so the old pickle resolves too).
 from src.training_pipeline.wrappers import (  # noqa: F401
-    FirstOutputWrapper, WeightedVoter, KerasWrapper,
+    FirstOutputWrapper, WeightedVoter,
 )
 
 _HISTORY_ROWS = 200   # cover the 168h lag window plus headroom
@@ -66,8 +66,8 @@ def load_champion():
         names = zf.namelist()
         model_type = zf.read("model_type.txt").decode().strip() if "model_type.txt" in names else "sklearn"
         if model_type == "keras":
-            # Champion should never be Keras (excluded from eligibility), but guard anyway.
-            print("[predict] Champion is Keras — not supported in the precompute step.")
+            # Keras models were retired; an old database may still hold one.
+            print("[predict] Champion is a retired Keras model. Run training to replace it.")
             return None, None, None, None, None, False
         try:
             model = pickle.loads(zf.read("model.pkl"))

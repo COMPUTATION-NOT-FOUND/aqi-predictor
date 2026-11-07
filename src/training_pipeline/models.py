@@ -3,8 +3,7 @@ All model definitions with their Optuna / RandomizedSearchCV search spaces.
 Models are organized as (name, estimator, search_space, tuner_type).
 """
 import numpy as np
-from sklearn.linear_model import Ridge, Lasso, ElasticNet
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import Ridge
 from sklearn.multioutput import MultiOutputRegressor
 from xgboost import XGBRegressor
 from catboost import CatBoostRegressor
@@ -20,52 +19,15 @@ def _wrap_multi(estimator, n_jobs=-1):
     return MultiOutputRegressor(estimator, n_jobs=n_jobs)
 
 
+# Ridge is the linear baseline. The tree ensembles that used to sit here
+# (RandomForest, GradientBoosting) were dropped: they were slower than the
+# boosters below, never won, and a pickled forest is large in GridFS.
 CLASSICAL_MODELS = [
     {
         "name": "Ridge",
         "estimator": _wrap_multi(Ridge(), n_jobs=1),
         "tuner": "random",
         "param_dist": {"estimator__alpha": [0.001, 0.01, 0.1, 1, 10, 100]},
-    },
-    {
-        "name": "Lasso",
-        "estimator": _wrap_multi(Lasso(max_iter=5000), n_jobs=1),
-        "tuner": "random",
-        "param_dist": {"estimator__alpha": [0.001, 0.01, 0.1, 1, 10, 100]},
-    },
-    {
-        "name": "ElasticNet",
-        "estimator": _wrap_multi(ElasticNet(max_iter=5000), n_jobs=1),
-        "tuner": "random",
-        "param_dist": {
-            "estimator__alpha":    [0.001, 0.01, 0.1, 1, 10],
-            "estimator__l1_ratio": np.linspace(0.1, 0.9, 9).tolist(),
-        },
-    },
-    {
-        "name": "RandomForest",
-        # n_jobs=1 here: RandomizedSearchCV(n_jobs=-1) already parallelises folds;
-        # setting both to -1 oversubscribes the 2-core free runner and slows things down.
-        "estimator": RandomForestRegressor(random_state=42, n_jobs=1),
-        "tuner": "random",
-        "param_dist": {
-            "n_estimators":      [50, 100, 150],
-            "max_depth":         [8, 12, 16, None],
-            "max_features":      ["sqrt", "log2"],
-            "min_samples_leaf":  [3, 5, 10],
-            "min_samples_split": [5, 10, 20],
-        },
-    },
-    {
-        "name": "GradientBoosting",
-        "estimator": _wrap_multi(GradientBoostingRegressor(random_state=42), n_jobs=1),
-        "tuner": "random",
-        "param_dist": {
-            "estimator__n_estimators":    [50, 100, 150],
-            "estimator__max_depth":       [3, 5, 7],
-            "estimator__learning_rate":   [0.05, 0.1, 0.2],
-            "estimator__min_samples_leaf":[3, 5, 10],
-        },
     },
 ]
 
@@ -138,30 +100,3 @@ OPTUNA_MODELS = [
         "n_trials": 8,
     },
 ]
-
-
-# ─── Keras Models (leaderboard-only; champion-ineligible) ─────────────────────
-
-def build_lstm(params: dict, n_features: int, n_outputs: int):
-    """Cheap cuDNN-compatible LSTM (no recurrent_dropout, which forces slow non-cuDNN path)."""
-    import tensorflow as tf
-    model = tf.keras.Sequential([
-        tf.keras.layers.Input(shape=(params["sequence_length"], n_features)),
-        tf.keras.layers.LSTM(params["units"], return_sequences=False),
-        tf.keras.layers.Dropout(params["dropout"]),
-        tf.keras.layers.Dense(n_outputs),
-    ])
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(params["learning_rate"]),
-        loss="mse",
-    )
-    return model
-
-
-def lstm_suggest(trial) -> dict:
-    return {
-        "units":           trial.suggest_categorical("units", [32, 64]),
-        "sequence_length": 24,
-        "dropout":         trial.suggest_float("dropout", 0.1, 0.3),
-        "learning_rate":   1e-3,
-    }

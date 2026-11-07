@@ -38,10 +38,3 @@ class WeightedVoter:
         preds = np.stack([m.predict(X) for m in self.models], axis=0)
         return np.einsum("i,ijk->jk", self.weights, preds)
 
-
-class KerasWrapper:
-    """Adapt a Keras model to the sklearn-style .predict(X) interface (DistilledMLP)."""
-    def __init__(self, model): self.model = model
-
-    def predict(self, X):
-        return self.model.predict(X, verbose=0)

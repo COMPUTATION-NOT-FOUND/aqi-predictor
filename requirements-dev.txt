@@ -1,0 +1,6 @@
+# Local extras: the EDA notebook and tests. Not used by any deployed job.
+-r requirements-training.txt
+plotly>=5.19.0
+jupyter>=1.0.0
+kaleido>=0.2.1   # static Plotly PNG export for the notebook
+pytest>=8.0.0

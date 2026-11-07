@@ -80,13 +80,9 @@ packages = [
     ("xgboost", "xgb"),
     ("lightgbm", "lgb"),
     ("catboost", "cb"),
-    ("tensorflow", "tf"),
     ("shap", "shap"),
     ("mapie", "mapie"),
     ("mlflow", "mlflow"),
-    ("dash", "dash"),
-    ("plotly", "plotly"),
-    ("mrmr", "mrmr"),
     ("statsmodels", "sm"),
     ("optuna", "optuna"),
 ]

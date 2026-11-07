@@ -6,18 +6,18 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─── API Keys ─────────────────────────────────────────────────────────────────
-AQICN_API_KEY       = os.getenv("AQICN_API_KEY")        # FILL IN: https://aqicn.org/api/
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")  # FILL IN: https://openweathermap.org/api
+AQICN_API_KEY       = os.getenv("AQICN_API_KEY")  # https://aqicn.org/api/
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")  # https://openweathermap.org/api
 
 # ─── MongoDB ───────────────────────────────────────────────────────────────────
-MONGODB_URI     = os.getenv("MONGODB_URI")               # FILL IN: Atlas SRV connection string
+MONGODB_URI     = os.getenv("MONGODB_URI")  # Atlas SRV connection string
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "aqi_db")
 
 # ─── MLflow ───────────────────────────────────────────────────────────────────
-MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "mlruns")  # FILL IN: set to remote MLflow URL if needed
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "mlruns")
 
 # ─── City Config ──────────────────────────────────────────────────────────────
-DEFAULT_CITY    = os.getenv("DEFAULT_CITY", "karachi")  # FILL IN: change to your target city
+DEFAULT_CITY    = os.getenv("DEFAULT_CITY", "karachi")
 DEFAULT_LAT     = float(os.getenv("DEFAULT_LAT", "24.8607"))   # Karachi latitude
 DEFAULT_LON     = float(os.getenv("DEFAULT_LON", "67.0011"))   # Karachi longitude
 
